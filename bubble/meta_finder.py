@@ -211,6 +211,14 @@ class VaultFinder(importlib.abc.MetaPathFinder):
         if actual_substrate == "dlmopen_isolated":
             return self._spec_via_dlmopen(alias, real_name, version, wheel_tag)
 
+        # Route to the subprocess-isolated substrate handler. Same
+        # IsolatedModule shape as dlmopen, but the isolation boundary
+        # is an OS process rather than a link namespace — portable
+        # everywhere Python runs, ~30MB per alias, full thread/signal
+        # isolation by construction.
+        if actual_substrate == "subprocess":
+            return self._spec_via_subprocess(alias, real_name, version, wheel_tag)
+
         # Default: in_process path (the existing direct-link route).
         vault_path = self._alias_vault_path(real_name, version, wheel_tag)
         if vault_path is None:
@@ -264,6 +272,35 @@ class VaultFinder(importlib.abc.MetaPathFinder):
         if self._verbose:
             sys.stderr.write(
                 f"[bubble] alias {alias} → dlmopen-isolated: "
+                f"{real_name}=={version} [{wheel_tag}]\n"
+            )
+        return spec
+
+    def _spec_via_subprocess(self, alias: str, real_name: str,
+                             version: str, wheel_tag: str):
+        """Build an import spec backed by the subprocess-isolated substrate.
+
+        Mirrors _spec_via_dlmopen — same integrity gate, same proxy
+        module shape — but the isolation boundary is an OS process.
+        The loader returns an IsolatedModule whose attribute access
+        marshals into a child Python over a length-prefixed pickle
+        channel. The vault path is verified before any child is
+        spawned, so vault drift refuses the alias before any cost is
+        paid."""
+        if not self._verify_or_record(real_name, version, wheel_tag):
+            return None
+        vault_path = self._alias_vault_path(real_name, version, wheel_tag)
+        if vault_path is None:
+            return None
+
+        from .substrate import subprocess as _subprocess_sub
+        loader = _SubprocessAliasLoader(
+            alias, vault_path, real_name, _subprocess_sub,
+        )
+        spec = importlib.util.spec_from_loader(alias, loader)
+        if self._verbose:
+            sys.stderr.write(
+                f"[bubble] alias {alias} → subprocess-isolated: "
                 f"{real_name}=={version} [{wheel_tag}]\n"
             )
         return spec
@@ -468,6 +505,25 @@ class _DlmopenAliasLoader(importlib.abc.Loader):
 
     def create_module(self, spec):
         return self._dlmopen.load_module(self._alias, self._vault_path, self._real)
+
+    def exec_module(self, module):
+        return None
+
+
+class _SubprocessAliasLoader(importlib.abc.Loader):
+    """Loader that hands back an IsolatedModule for the subprocess-isolated
+    substrate. Same shape as _DlmopenAliasLoader; the substrate handler
+    underneath is what differs — child OS process instead of dlmopen
+    link namespace."""
+
+    def __init__(self, alias: str, vault_path, real_name: str, subprocess_mod):
+        self._alias = alias
+        self._vault_path = vault_path
+        self._real = real_name
+        self._sub = subprocess_mod
+
+    def create_module(self, spec):
+        return self._sub.load_module(self._alias, self._vault_path, self._real)
 
     def exec_module(self, module):
         return None
