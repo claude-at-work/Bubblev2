@@ -113,6 +113,38 @@ Confirmed: an alias declared `substrate = "dlmopen_isolated"` routes through a f
 
 Confirmed-temporal: a late-arriving alias doesn't retroactively perturb an already-loaded module. Isolation holds across the process lifetime, not just across the namespace. (Test: `tests/10_breakers/test_late_alias_does_not_corrupt_earlier.py`.)
 
+### Differential evaluation across versions
+
+Multi-version coexistence answers *can two versions live together?* The follow-on question agent runtimes actually ask is *what changed between them?* — and that's the verb `bubble.tools.diff` exposes on top of `AgentVault`:
+
+```python
+from bubble import AgentVault
+from bubble.tools import diff
+
+with AgentVault() as av:
+    av.add("requests", version="2.31.0")
+    av.add("requests", version="2.32.5")
+    av.register("r_old", real_name="requests", version="2.31.0", wheel_tag="py3-none-any")
+    av.register("r_new", real_name="requests", version="2.32.5", wheel_tag="py3-none-any")
+
+    # Single-shot
+    cr = diff.compare(av, "m.utils.requote_uri('a b/c')",
+                      aliases=["r_old", "r_new"])
+
+    # Multi-input differential, with regression-boundary ranking
+    fr = diff.fuzz(av, "m.utils.requote_uri(x)",
+                   aliases=["r_old", "r_new"],
+                   n=500, strategy="strings")
+
+    # Binary-search the alias range for the adjacent pair where output changed
+    br = diff.bisect(av, ["click_v0", "click_v1", "click_v2", "click_v3"],
+                     "m.style('hello').encode()")
+```
+
+`compare`, `fuzz`, and `bisect` return dataclasses (`CompareResult`, `FuzzResult`, `BisectResult`); no printing, no terminal control — callers format however they like. The library never touches `sys.modules`, `sys.meta_path`, or the SQLite index directly: every module access goes through `av.tool()`, so the substrate ladder stays in charge of how isolation actually happens. The same expression evaluated across an `in_process` alias and a `subprocess` alias works without any new code path on diff's side. (Test: `tests/10_breakers/test_diff_primitive.py`.)
+
+`fuzz()` accepts a custom `inputs=` corpus alongside the built-in `strings/ints/floats/bytes` strategies — the hook for *corpus-guided fuzzing from real call sites* once a project wants to fuzz against the actual payload shapes its production code feeds in.
+
 ### Recorded lockfiles
 
 A run with `--lock script.lock` writes the closure that *actually loaded*. No separate `bubble lock` command. Reproducibility comes from observation, not declaration.
