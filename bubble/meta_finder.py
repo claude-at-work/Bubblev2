@@ -31,8 +31,11 @@ def _untrappable(name: str) -> bool:
         return True
     if name.startswith("_"):
         return True
-    if _MYPYC_RE.match(name):
-        return True
+    # Note: mypyc-mangled names ARE trappable now — they live in the
+    # vault next to the package that imports them, and the finder
+    # resolves them via _lookup_mypyc_helper. Skipping them here would
+    # break --isolate runs of any package whose deps were mypyc-built
+    # (charset-normalizer, chardet, increasingly common).
     if name in _NAMESPACE_ROOTS:
         return True
     return False
@@ -131,6 +134,17 @@ class VaultFinder(importlib.abc.MetaPathFinder):
         if _untrappable(top):
             return None
         if top in self._fetch_failed:
+            return None
+
+        # mypyc-compiled packages ship a hex-prefixed helper module
+        # (e.g. `81d243bd2c585b0f4821__mypyc`) at the top level alongside
+        # the package they support. Under --isolate we have no system
+        # site-packages to fall back on, so search the vault directly
+        # for a matching `.so` and serve it.
+        if _MYPYC_RE.match(top):
+            spec = self._spec_for_mypyc_helper(top, target)
+            if spec is not None:
+                return spec
             return None
 
         vault_path = self._lookup(top)
@@ -253,6 +267,31 @@ class VaultFinder(importlib.abc.MetaPathFinder):
                 f"{real_name}=={version} [{wheel_tag}]\n"
             )
         return spec
+
+    def _spec_for_mypyc_helper(self, name: str, target):
+        """Find a mypyc helper `.so` anywhere in the vault and serve it.
+
+        The helper's name has a unique hex prefix per build, so a
+        vault-wide glob hits at most one file. We import it as a
+        top-level module via PathFinder against its containing
+        directory; ExtensionFileLoader handles the actual load."""
+        from . import config
+        if not config.VAULT_DIR.exists():
+            return None
+        for candidate in config.VAULT_DIR.rglob(f"{name}.*.so"):
+            if not candidate.is_file():
+                continue
+            container = candidate.parent
+            spec = importlib.machinery.PathFinder.find_spec(
+                name, [str(container)], target,
+            )
+            if spec is not None:
+                if self._verbose:
+                    sys.stderr.write(
+                        f"[bubble] mypyc helper {name} → {candidate}\n"
+                    )
+                return spec
+        return None
 
     # ───────────────────── default path ─────────────────────
 
