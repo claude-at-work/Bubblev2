@@ -184,18 +184,43 @@ bubble/
                           shell bundle / unbundle
 ```
 
-Ships as a single `bubble.pyz` zipapp via stdlib `zipapp`. ~217KB. No third-party dependencies.
+Distributed as source; builds to a single `bubble.pyz` zipapp via stdlib `zipapp` (`python3 tools/build_pyz.py`, see *Installation*). ~93 KB, deterministic, no third-party dependencies.
 
 ---
 
 ## Installation
 
 ```bash
-# Single artifact, drop and go
-cp bubble.pyz /usr/local/bin/bubble && chmod +x /usr/local/bin/bubble
+git clone https://github.com/claude-at-work/Bubblev2.git
+cd Bubblev2
+./install.sh                # → ~/.local/bin/bubble (no sudo)
+```
 
-# Or run as a Python module
-python3 bubble.pyz vault list
+That's it. `install.sh` builds `bubble.pyz` from source via `tools/build_pyz.py` (pure stdlib `zipapp`, no third-party deps, no `setup.py`) and drops a single self-contained executable on disk.
+
+Install somewhere else by passing the destination directory:
+
+```bash
+./install.sh /usr/local/bin     # system-wide (may need sudo)
+./install.sh /opt/bubble/bin    # custom prefix, anywhere you control
+```
+
+Or skip the installer and use the build directly:
+
+```bash
+python3 tools/build_pyz.py      # → bubble.pyz + bubble.pyz.sha256
+./bubble.pyz --help             # run from the clone, no install
+```
+
+The build is deterministic — same source bytes in produces the same archive bytes out, with embedded mtimes pinned to a fixed epoch. `sha256sum -c bubble.pyz.sha256` verifies the build.
+
+### The vault lives separately
+
+`BUBBLE_HOME` (default `~/.bubble`) decides where the vault sits, independently of the binary. Install to one place and put the vault on a bigger volume:
+
+```bash
+export BUBBLE_HOME=/data/bubble
+bubble vault list
 ```
 
 ---
