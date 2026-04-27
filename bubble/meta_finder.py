@@ -178,6 +178,81 @@ class VaultFinder(importlib.abc.MetaPathFinder):
             conn.close()
         return Path(row[0]) if row else None
 
+    # ───────────────── importlib.metadata per-alias ─────────────────
+    #
+    # Modern packages compute their own version (and increasingly their
+    # entry-point graph) via importlib.metadata.version(__name__) instead
+    # of a hardcoded string — click 8.3+, for example. Without this hook,
+    # an aliased click_v0 calling version("click") would walk sys.path
+    # and report whatever click is installed in the host venv, silently
+    # collapsing the diamond-conflict story for any metadata-driven tool.
+    #
+    # The contract:
+    #   - When called from inside an alias namespace, return the vault
+    #     dist-info for that alias's pinned version.
+    #   - When called from outside any alias, don't claim — let the host's
+    #     standard finders resolve normally.
+    #
+    # The alias scope is determined by walking the call stack, since
+    # importlib.metadata's API has no channel for "who's asking."
+    def find_distributions(self, context=None):
+        import importlib.metadata as md
+
+        scope_alias = self._caller_alias_scope()
+        if scope_alias is None or scope_alias not in self._aliases:
+            return
+
+        real_name, version, wheel_tag, _sub = self._aliases[scope_alias]
+
+        requested_name = getattr(context, "name", None) if context is not None else None
+        if requested_name is not None:
+            from .vault.metadata import normalize_name
+            if normalize_name(requested_name) != normalize_name(real_name):
+                return
+
+        vault_path = self._alias_vault_path(real_name, version, wheel_tag)
+        if vault_path is None:
+            return
+
+        # Distinfo dirs follow `<name>-<version>.dist-info` per PEP 427.
+        # Try the literal name first, then the PEP 503 underscore form.
+        candidates = list(vault_path.glob(f"{real_name}-{version}.dist-info"))
+        if not candidates:
+            from .vault.metadata import normalize_name
+            norm = normalize_name(real_name).replace("-", "_")
+            candidates = list(vault_path.glob(f"{norm}-{version}.dist-info"))
+        if not candidates:
+            candidates = list(vault_path.glob("*.dist-info"))
+        if not candidates:
+            return
+
+        if self._verbose:
+            sys.stderr.write(
+                f"[bubble] metadata for {requested_name or '*'} → "
+                f"{scope_alias} ({real_name}=={version}) "
+                f"from {candidates[0].name}\n"
+            )
+        yield md.PathDistribution(candidates[0])
+
+    def _caller_alias_scope(self) -> Optional[str]:
+        """Walk the calling frames to find the nearest alias namespace.
+
+        Returns the alias name (e.g. 'click_v0') if any frame on the stack
+        belongs to an alias module or its submodules; None otherwise. We
+        skip our own frame and any importlib internals — alias code is
+        always somewhere further up."""
+        f = sys._getframe(1)
+        while f is not None:
+            mod_name = f.f_globals.get("__name__", "")
+            if mod_name in self._aliases:
+                return mod_name
+            if "." in mod_name:
+                top = mod_name.split(".", 1)[0]
+                if top in self._aliases:
+                    return top
+            f = f.f_back
+        return None
+
     def _spec_for_alias(self, alias: str):
         real_name, version, wheel_tag, requested_substrate = self._aliases[alias]
 
