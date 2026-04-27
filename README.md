@@ -184,7 +184,7 @@ bubble/
                           shell bundle / unbundle
 ```
 
-Ships as a single `bubble.pyz` zipapp via stdlib `zipapp`. ~217KB. No third-party dependencies.
+Distributed as source; builds to a single `bubble.pyz` zipapp via stdlib `zipapp` (`python3 tools/build_pyz.py`, see *Installation*). ~93 KB, deterministic, no third-party dependencies.
 
 ---
 
