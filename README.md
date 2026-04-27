@@ -190,13 +190,42 @@ Ships as a single `bubble.pyz` zipapp via stdlib `zipapp`. ~217KB. No third-part
 
 ## Installation
 
-```bash
-# Single artifact, drop and go
-cp bubble.pyz /usr/local/bin/bubble && chmod +x /usr/local/bin/bubble
+### Build from source
 
-# Or run as a Python module
+A fresh clone doesn't ship `bubble.pyz`. Build it from the source tree — `tools/build_pyz.py` is the recursive-self-host path: bubble produces its own deployment artifact via stdlib `zipapp`, no third-party deps, no `setup.py` / `pyproject` build step.
+
+```bash
+git clone https://github.com/claude-at-work/Bubblev2.git
+cd Bubblev2
+python3 tools/build_pyz.py
+# → bubble.pyz + bubble.pyz.sha256
+
+./bubble.pyz --help     # run directly, anywhere
+```
+
+The build is deterministic — same source bytes in produces the same archive bytes out, with embedded mtimes pinned to a fixed epoch. The sidecar `.sha256` is the artifact's own integrity fact: `sha256sum -c bubble.pyz.sha256` verifies the build.
+
+### Drop-in install
+
+`bubble.pyz` is a self-contained zipapp with a `#!/usr/bin/env python3` shebang. Drop it anywhere on `PATH` and run it; no installer, no virtualenv, no link tree.
+
+```bash
+# System-wide (needs sudo)
+sudo cp bubble.pyz /usr/local/bin/bubble && sudo chmod +x /usr/local/bin/bubble
+
+# User-local — no sudo, no system writes
+mkdir -p ~/.local/bin
+cp bubble.pyz ~/.local/bin/bubble && chmod +x ~/.local/bin/bubble
+# ensure ~/.local/bin is on PATH:  export PATH="$HOME/.local/bin:$PATH"
+
+# Custom prefix — same idea, anywhere you control
+install -Dm755 bubble.pyz /opt/bubble/bin/bubble
+
+# Or skip install entirely and run as a Python module
 python3 bubble.pyz vault list
 ```
+
+`BUBBLE_HOME` (default `~/.bubble`) decides where the vault lives, independently of where the binary sits — install to one place, vault somewhere else if you want.
 
 ---
 
