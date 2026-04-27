@@ -193,26 +193,34 @@ Distributed as source; builds to a single `bubble.pyz` zipapp via stdlib `zipapp
 ```bash
 git clone https://github.com/claude-at-work/Bubblev2.git
 cd Bubblev2
-./install.sh                # → ~/.local/bin/bubble (no sudo)
+./install.sh
 ```
 
-That's it. `install.sh` builds `bubble.pyz` from source via `tools/build_pyz.py` (pure stdlib `zipapp`, no third-party deps, no `setup.py`) and drops a single self-contained executable on disk.
+That's it. The installer:
 
-Install somewhere else by passing the destination directory:
+1. Builds `bubble.pyz` from source (pure stdlib `zipapp`, no third-party deps).
+2. Drops it at `~/.local/bin/bubble` (no sudo).
+3. Runs `bubble setup` — probes the host, scans every `site-packages` this Python install knows about, hardlinks everything into the vault.
+
+You're done. `bubble --help` works, `bubble vault list` shows your existing Python ecosystem already vaulted, `bubble run script.py` works against it.
+
+### Variations
 
 ```bash
-./install.sh /usr/local/bin     # system-wide (may need sudo)
-./install.sh /opt/bubble/bin    # custom prefix, anywhere you control
+./install.sh /usr/local/bin       # system-wide (may need sudo)
+./install.sh /opt/bubble/bin      # custom prefix
+BUBBLE_SKIP_SETUP=1 ./install.sh  # install only, skip the vault scan
 ```
 
-Or skip the installer and use the build directly:
+The build is deterministic — same source bytes produce a byte-identical archive. `sha256sum -c bubble.pyz.sha256` verifies the build.
+
+### Re-scanning after `pip install something-new`
+
+`bubble setup` is idempotent — re-running it only adds entries that aren't already vaulted. Run it again any time:
 
 ```bash
-python3 tools/build_pyz.py      # → bubble.pyz + bubble.pyz.sha256
-./bubble.pyz --help             # run from the clone, no install
+bubble setup
 ```
-
-The build is deterministic — same source bytes in produces the same archive bytes out, with embedded mtimes pinned to a fixed epoch. `sha256sum -c bubble.pyz.sha256` verifies the build.
 
 ### The vault lives separately
 
@@ -220,7 +228,7 @@ The build is deterministic — same source bytes in produces the same archive by
 
 ```bash
 export BUBBLE_HOME=/data/bubble
-bubble vault list
+bubble setup
 ```
 
 ---
