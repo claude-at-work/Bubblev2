@@ -63,4 +63,13 @@ def _register_dlmopen() -> None:
     _HANDLERS["dlmopen_isolated"] = _dlmopen_mod
 
 
+def _register_subprocess() -> None:
+    try:
+        from . import subprocess as _subprocess_mod
+    except Exception as exc:
+        return  # handler module itself failed to import; skip silently
+    _HANDLERS["subprocess"] = _subprocess_mod
+
+
 _register_dlmopen()
+_register_subprocess()
