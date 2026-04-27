@@ -31,19 +31,36 @@ echo "installed: $DEST/$NAME"
 echo "build sha: $(cut -d' ' -f1 < "$HERE/bubble.pyz.sha256")"
 
 # Friendly PATH check — don't modify rc files; just tell the user.
+ON_PATH=1
 case ":$PATH:" in
-    *":$DEST:"*)
-        ;;
-    *)
-        echo
-        echo "note: $DEST is not on your PATH. Add it to your shell rc:"
-        echo "  echo 'export PATH=\"$DEST:\$PATH\"' >> ~/.bashrc"
-        echo "or run with the full path:  $DEST/$NAME --help"
-        ;;
+    *":$DEST:"*) ;;
+    *) ON_PATH=0 ;;
 esac
 
+if [ "$ON_PATH" = "0" ]; then
+    echo
+    echo "note: $DEST is not on your PATH. Add it to your shell rc:"
+    echo "  echo 'export PATH=\"$DEST:\$PATH\"' >> ~/.bashrc"
+fi
+
+# Run setup unless explicitly skipped — fills the vault from every
+# site-packages this Python knows about, hardlinking by default. Safe to
+# re-run; idempotent. BUBBLE_SKIP_SETUP=1 ./install.sh skips it.
+if [ "${BUBBLE_SKIP_SETUP:-0}" = "0" ]; then
+    echo
+    echo "running first-time setup (vault scan)..."
+    "$DEST/$NAME" setup || {
+        echo "setup hit an error; bubble itself is installed and runnable." >&2
+        echo "you can re-run setup any time:  $NAME setup" >&2
+    }
+fi
+
 echo
-echo "try:"
-echo "  $NAME --help"
-echo "  $NAME probe          # writes ~/.bubble/host.toml"
-echo "  $NAME vault list     # empty until you populate it"
+echo "ready. try:"
+if [ "$ON_PATH" = "0" ]; then
+    echo "  $DEST/$NAME --help"
+    echo "  $DEST/$NAME vault list"
+else
+    echo "  $NAME --help"
+    echo "  $NAME vault list"
+fi

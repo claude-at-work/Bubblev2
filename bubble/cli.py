@@ -339,6 +339,82 @@ def cmd_host(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_setup(args: argparse.Namespace) -> int:
+    """bubble setup — zero-flag bootstrap.
+
+    Probes the host, scans every site-packages this Python install knows
+    about, imports everything into the vault (hardlink by default, falling
+    back to copy on cross-fs). Idempotent: re-running after `pip install`
+    only adds the new entries.
+    """
+    from . import probe
+    import site as _site
+    import sys as _sys
+    config.ensure_dirs()
+    db.init_db()
+
+    # 1. Probe — host portrait + substrate menu.
+    print("probing host...")
+    results = probe.run_all()
+    out_path = probe.host_toml_path()
+    probe.write(out_path, results)
+    py = results["python"]
+    k = results["kernel"]
+    print(f"  python {py['version']}  {k['system']} {k['machine']}")
+    avail = [s["name"] for s in results["substrates"]
+             if s.get("status", "").startswith("available")]
+    if avail:
+        print(f"  substrates: {', '.join(avail)}")
+
+    # 2. Discover every site-packages on this interpreter's view.
+    candidates: set[Path] = set()
+    for p in _sys.path:
+        if "packages" in p:
+            pp = Path(p)
+            if pp.is_dir():
+                candidates.add(pp.resolve())
+    for p in _site.getsitepackages():
+        pp = Path(p)
+        if pp.is_dir():
+            candidates.add(pp.resolve())
+
+    # Don't recurse into our own vault tree.
+    bubble_home = Path(config.BUBBLE_HOME).resolve()
+    candidates = {p for p in candidates
+                  if bubble_home not in p.parents and p != bubble_home}
+
+    if not candidates:
+        print("\nno site-packages directories on this interpreter's path.")
+        print("nothing to scan.  vault is ready at", bubble_home)
+        return 0
+
+    # 3. Import each, hardlinking by default (falls back to copy on EXDEV).
+    print(f"\nscanning {len(candidates)} site-packages director"
+          f"{'y' if len(candidates) == 1 else 'ies'}...")
+    totals = {"imported": 0, "skipped": 0, "errors": 0, "missing_record": 0}
+    for sp in sorted(candidates):
+        n_dists = len(list(sp.glob("*.dist-info")))
+        print(f"  {sp}  ({n_dists} dists)")
+        r = importer.import_site_packages(sp, hardlink=True, overwrite=False)
+        for k_ in totals:
+            totals[k_] += r.get(k_, 0)
+
+    # 4. Report what's ready.
+    print(f"\nvault ready: {bubble_home}")
+    print(f"  imported now:    {totals['imported']}")
+    print(f"  already vaulted: {totals['skipped']}")
+    if totals["missing_record"]:
+        print(f"  no RECORD file:  {totals['missing_record']}  (silent skip)")
+    if totals["errors"]:
+        print(f"  errors:          {totals['errors']}")
+    print()
+    print("try:")
+    print("  bubble vault list                 # see what's vaulted")
+    print("  bubble run your-script.py         # vault-only by default")
+    print("  bubble run your-script.py --fetch # allow PyPI fallback")
+    return 0 if totals["errors"] == 0 else 2
+
+
 def cmd_probe(args: argparse.Namespace) -> int:
     """bubble probe — interrogate the machine, write host.toml."""
     from . import probe
@@ -575,8 +651,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     iv = vsub.add_parser("import-venv", help="import packages from a venv site-packages")
     iv.add_argument("path", help="path to a venv root or its site-packages dir")
-    iv.add_argument("--hardlink", action="store_true",
-                    help="hardlink files instead of copying (saves disk, same fs only)")
+    iv.add_argument("--copy", dest="hardlink", action="store_false",
+                    help="copy files into the vault instead of hardlinking "
+                         "(default is hardlink, with automatic fallback to "
+                         "copy on cross-filesystem)")
+    iv.add_argument("--hardlink", dest="hardlink", action="store_true",
+                    help=argparse.SUPPRESS)  # kept for compatibility; default
+    iv.set_defaults(hardlink=True)
     iv.add_argument("--overwrite", action="store_true",
                     help="re-import even if already vaulted at same (name,version,tag)")
     iv.add_argument("--skip", nargs="*", help="package names to skip")
@@ -672,6 +753,11 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--prerelease", action="store_true")
     up.add_argument("--verbose", "-v", action="store_true")
     up.set_defaults(func=cmd_up)
+
+    # setup — zero-flag bootstrap (probe + scan all site-packages)
+    st = sub.add_parser("setup",
+        help="bootstrap: probe the host and import every site-packages into the vault")
+    st.set_defaults(func=cmd_setup)
 
     # probe — write host.toml self-portrait
     pr = sub.add_parser("probe",
