@@ -62,3 +62,31 @@ def detect_host() -> str:
             return "debian-proot"
         return "debian"
     return "linux"
+
+
+def set_home(home: Path | str) -> None:
+    """Rebind every BUBBLE_HOME-derived path to a new root.
+
+    The module-level path constants are read at import time, but other
+    modules consult them via attribute access (`config.VAULT_DB`) rather
+    than capturing values at their own import. So rebinding the
+    attributes here propagates live across the package.
+
+    The intended consumer is `bubble.AgentVault`: an embedding agent
+    framework wants a vault separate from the user's `~/.bubble`, and
+    setting `BUBBLE_HOME` in the environment doesn't help once bubble
+    is already imported. This function is the supported path for
+    re-rooting the package after import.
+    """
+    global BUBBLE_HOME, VAULT_DIR, VAULT_DB, BUBBLES_DIR
+    global SHELLS_DIR, LOGS_DIR, WHEELS_DIR, STAGING_DIR
+    new_home = Path(home).expanduser().resolve()
+    BUBBLE_HOME = new_home
+    VAULT_DIR = new_home / "vault"
+    VAULT_DB = new_home / "vault.db"
+    BUBBLES_DIR = new_home / "bubbles"
+    SHELLS_DIR = new_home / "shells"
+    LOGS_DIR = new_home / "logs"
+    WHEELS_DIR = new_home / "wheels"
+    STAGING_DIR = VAULT_DIR / ".staging"
+    os.environ["BUBBLE_HOME"] = str(new_home)
