@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from . import config
+from . import bridge
 from .vault import db, store, importer
 from .run import shell as shell_mod
 
@@ -422,6 +423,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     return rc
 
 
+def cmd_bridge(args: argparse.Namespace) -> int:
+    """bubble bridge <script> — orchestrate main + legacy runners."""
+    return bridge.run(args)
+
+
 def _write_lockfile(path: Path, hits: list) -> None:
     """A run's hit log IS the lockfile. (import_name, package, version, wheel_tag) per line."""
     seen = set()
@@ -693,6 +699,23 @@ def build_parser() -> argparse.ArgumentParser:
                      help="strip system site-packages from sys.path; vault is sole source")
     run.add_argument("--verbose", "-v", action="store_true")
     run.set_defaults(func=cmd_run)
+
+    # bridge — route .py to main bubble and .js/.ts to legacy with guardrails
+    br = sub.add_parser("bridge",
+        help="route .py to main bubble and .js/.ts to legacy bubble with guardrails")
+    br.add_argument("script")
+    br.add_argument("args", nargs="*")
+    br.add_argument("--fetch", action="store_true",
+                    help="for .py routes only: authorize PyPI fetch on vault miss")
+    br.add_argument("--no-isolate", action="store_true",
+                    help="for .py routes only: keep system site-packages on sys.path")
+    br.add_argument("--allow-legacy-network", action="store_true",
+                    help="for .js/.ts routes only: authorize legacy network fetch")
+    br.add_argument("--keep", action="store_true",
+                    help="for legacy routes only: keep ephemeral bubble after run")
+    br.add_argument("--dry-run", action="store_true",
+                    help="print selected command and exit")
+    br.set_defaults(func=cmd_bridge)
 
     return p
 
