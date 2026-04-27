@@ -1,0 +1,64 @@
+"""Paths, environment, and host detection."""
+
+from __future__ import annotations
+
+import os
+import sys
+import sysconfig
+from pathlib import Path
+
+
+BUBBLE_HOME = Path(os.environ.get("BUBBLE_HOME", os.path.expanduser("~/.bubble")))
+
+VAULT_DIR = BUBBLE_HOME / "vault"
+VAULT_DB = BUBBLE_HOME / "vault.db"
+BUBBLES_DIR = BUBBLE_HOME / "bubbles"
+SHELLS_DIR = BUBBLE_HOME / "shells"
+LOGS_DIR = BUBBLE_HOME / "logs"
+WHEELS_DIR = BUBBLE_HOME / "wheels"
+STAGING_DIR = VAULT_DIR / ".staging"
+
+
+def ensure_dirs() -> None:
+    """Create vault directories. The whole tree is 0o700 by default — wheel
+    payloads regularly contain dist-info tokens, partial credentials baked
+    into examples, and other things the user did not consent to making
+    world-readable. If a dir already exists at a wider mode (user's choice),
+    we leave it alone.
+    """
+    for d in (BUBBLE_HOME, VAULT_DIR, BUBBLES_DIR, SHELLS_DIR,
+              LOGS_DIR, WHEELS_DIR, STAGING_DIR):
+        existed = d.exists()
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not existed:
+            try:
+                d.chmod(0o700)
+            except OSError:
+                pass
+
+
+def runner_python_tag() -> str:
+    """The wheel-tag fragment for the current interpreter, e.g. 'cp313'."""
+    impl = sys.implementation.name
+    impl_short = {"cpython": "cp", "pypy": "pp"}.get(impl, impl[:2])
+    return f"{impl_short}{sys.version_info.major}{sys.version_info.minor}"
+
+
+def runner_platform_tag() -> str:
+    """Platform tag fragment, e.g. 'manylinux2014_aarch64' or 'linux_aarch64'.
+    Best-effort; sysconfig is authoritative when available."""
+    plat = sysconfig.get_platform().replace("-", "_").replace(".", "_")
+    return plat
+
+
+def detect_host() -> str:
+    """Coarse host classification for shim-profile selection."""
+    prefix = os.environ.get("PREFIX", "")
+    if "com.termux" in prefix:
+        return "termux"
+    if Path("/etc/debian_version").exists() and Path("/proc/1/root").exists():
+        # proot-distro distros tend to mount root weirdly; cheap heuristic
+        if "proot" in os.environ.get("PROOT_TMP_DIR", "") or os.path.exists("/proc/self/root/.l2s"):
+            return "debian-proot"
+        return "debian"
+    return "linux"
