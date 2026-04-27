@@ -1,6 +1,8 @@
 """Claim: bubble can produce its own deployment artifact (bubble.pyz)
 through its own runtime — `python3 -m bubble run tools/build_pyz.py`
-walks the recursive self-host one notch.
+walks the recursive self-host one notch — and the build is
+deterministic, so the artifact's fingerprint is a function of source
+bytes alone.
 
 This is Path B of the bootstrap thread, the safe-side first move:
 the build is a pure copy-and-zip operation over bubble's own source
@@ -9,14 +11,25 @@ installation script to run. The discipline the architecture is shaped
 around — bubble does not run the installation script — is not tested
 here; it is demonstrated still standing.
 
+Determinism is a smaller geodesic move taken alongside: the integrity
+edge bubble draws around vault entries (sha256 over bytes, recorded
+once at commit) only carries weight if the same source produces the
+same bytes. Without determinism, the produced sha256 is a fact about
+the run, not about the source. With it, two operators on different
+machines building from the same git ref get identical fingerprints —
+the deployment artifact becomes content-addressed in the same shape
+the vault's entries already are.
+
 Pinned:
   - tools/build_pyz.py exists and is runnable via `python3 -m bubble run`
   - the produced .pyz is a valid zip-app: invoking it as `python3 X.pyz
     --help` returns argparse output naming the bubble subcommands
   - the produced .pyz carries a .sha256 sidecar matching its bytes
   - bubble.pyz can be re-invoked recursively: the produced .pyz is itself
-    able to print --help, demonstrating the artifact is self-contained
-    (a smoke test, not a full functional check)
+    able to run `vault list` against a fresh BUBBLE_HOME
+  - two consecutive builds from the same source produce byte-identical
+    archives — the integrity edge bubble draws around vault entries
+    extends to the artifact bubble itself ships as
 """
 import hashlib
 import os
@@ -119,6 +132,33 @@ def body(r: Result):
                 f"produced pyz `vault list` returned: "
                 f"{recursed.stdout.strip()!r}"
             )
+
+        # Determinism: build a second time into a different path; the
+        # bytes must match. Without this, the .sha256 sidecar records a
+        # fact about the run, not about the source — the integrity edge
+        # is incomplete one rung above the vault.
+        second_pyz = Path(td) / "bubble-second.pyz"
+        proc2 = subprocess.run(
+            [sys.executable, "-m", "bubble", "run", str(BUILD_SCRIPT),
+             "--", "-o", str(second_pyz)],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert proc2.returncode == 0, (
+            f"second build failed (rc={proc2.returncode}): {proc2.stderr}"
+        )
+        h2 = hashlib.sha256()
+        with second_pyz.open("rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h2.update(chunk)
+        second_digest = h2.hexdigest()
+        assert second_digest == actual, (
+            f"build is non-deterministic: first={actual} "
+            f"second={second_digest}"
+        )
+        r.evidence.append(
+            f"deterministic: two builds same source → identical "
+            f"sha256 {actual[:16]}…"
+        )
 
     r.passed = True
 

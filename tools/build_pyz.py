@@ -12,37 +12,97 @@ copy-and-zip operation. That's the whole point — the safe-side bootstrap
 demonstrates the existing line without testing it.
 
 Invariants preserved:
-  - stdlib only (zipapp, shutil, pathlib, hashlib)
+  - stdlib only (zipfile, hashlib, pathlib)
   - source tree is read, not executed
   - the produced .pyz is content-addressed: a sha256 over the bytes is
     written next to it, so the artifact carries its own integrity fact
+  - the build is deterministic: same source bytes in → same archive
+    bytes out → same sha256. Achieved by sorting entries and pinning
+    every embedded mtime to a fixed epoch (SOURCE_DATE_EPOCH semantics
+    drawn from the Reproducible Builds project, but with a default we
+    set rather than borrow from environment to keep the artifact's
+    fingerprint a function of source alone)
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
-import shutil
+import io
+import stat
+import struct
 import sys
-import tempfile
-import zipapp
+import zipfile
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUBBLE_PKG = REPO_ROOT / "bubble"
 
+# Fixed epoch for embedded mtimes. 2020-01-01 00:00:00 UTC.
+# Choice is arbitrary but stable: the artifact's sha256 must be a
+# function of source bytes, not of when the build ran.
+_FIXED_EPOCH = (2020, 1, 1, 0, 0, 0)
 
-def _stage(staging: Path) -> Path:
-    """Copy bubble/ into a staging dir. zipapp wants a directory whose
-    contents become the archive root; we put bubble/ at the root so
-    `python bubble.pyz` finds bubble/__main__.py."""
-    target = staging / "bubble"
-    shutil.copytree(
-        BUBBLE_PKG, target,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
-    )
-    return staging
+_IGNORE_NAMES = {"__pycache__"}
+_IGNORE_SUFFIXES = {".pyc", ".pyo"}
+
+
+def _walk_sources(root: Path) -> list[Path]:
+    """Return all files under `root` that should be included in the
+    archive, in deterministic (sorted, relative) order. Skips compiled
+    artifacts and cache dirs so the archive is content-determined by
+    source files alone."""
+    files: list[Path] = []
+    for p in sorted(root.rglob("*")):
+        if not p.is_file():
+            continue
+        if any(part in _IGNORE_NAMES for part in p.relative_to(root).parts):
+            continue
+        if p.suffix in _IGNORE_SUFFIXES:
+            continue
+        files.append(p)
+    return files
+
+
+def _write_archive(
+    out_path: Path, sources: list[tuple[str, bytes]],
+    interpreter: str, main_func: str,
+) -> None:
+    """Write a zipapp manually so every byte is under our control:
+    sorted entries, fixed mtimes, fixed external attrs, no extras.
+
+    The shebang line is written first as raw bytes, then the zip
+    archive is appended. Python's zipimport reads from the end of the
+    file and ignores any prefix, so the shebang doesn't disturb load."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        # __main__.py inside the archive routes to the bubble entry
+        # point. zipapp normally generates this; we generate it
+        # ourselves with a deterministic body.
+        module, func = main_func.split(":")
+        main_py = (
+            f"# -*- coding: utf-8 -*-\n"
+            f"import {module}\n"
+            f"{module}.{func}()\n"
+        ).encode("utf-8")
+        all_entries = [("__main__.py", main_py)] + sources
+        all_entries.sort(key=lambda kv: kv[0])
+        for arcname, data in all_entries:
+            info = zipfile.ZipInfo(filename=arcname, date_time=_FIXED_EPOCH)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = (0o644 << 16)  # -rw-r--r--
+            info.create_system = 3  # Unix
+            zf.writestr(info, data)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("wb") as f:
+        f.write(b"#!" + interpreter.encode("utf-8") + b"\n")
+        f.write(buf.getvalue())
+    # Make the produced file executable so it can be invoked directly
+    # (`./bubble.pyz vault list`). The shebang we just wrote is the
+    # other half of that affordance.
+    out_path.chmod(out_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
 def _sha256(path: Path) -> str:
@@ -55,17 +115,14 @@ def _sha256(path: Path) -> str:
 
 def build(out_path: Path, *, interpreter: str = "/usr/bin/env python3") -> dict:
     out_path = out_path.resolve()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    src_files = _walk_sources(BUBBLE_PKG)
+    sources: list[tuple[str, bytes]] = []
+    for path in src_files:
+        rel = "bubble/" + str(path.relative_to(BUBBLE_PKG)).replace("\\", "/")
+        sources.append((rel, path.read_bytes()))
 
-    with tempfile.TemporaryDirectory(prefix="bubble-pyz-build-") as td:
-        staging = _stage(Path(td))
-        zipapp.create_archive(
-            source=staging,
-            target=out_path,
-            interpreter=interpreter,
-            main="bubble.cli:main",
-            compressed=True,
-        )
+    _write_archive(out_path, sources, interpreter=interpreter,
+                   main_func="bubble.cli:main")
 
     digest = _sha256(out_path)
     sidecar = out_path.with_suffix(out_path.suffix + ".sha256")
@@ -75,11 +132,12 @@ def build(out_path: Path, *, interpreter: str = "/usr/bin/env python3") -> dict:
         "size_bytes": out_path.stat().st_size,
         "sha256": digest,
         "sidecar": str(sidecar),
+        "file_count": len(sources) + 1,  # +1 for __main__.py
     }
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Build bubble.pyz")
+    p = argparse.ArgumentParser(description="Build bubble.pyz (deterministic)")
     p.add_argument(
         "-o", "--output", default=str(REPO_ROOT / "bubble.pyz"),
         help="output path (default: bubble.pyz at repo root)",
@@ -92,8 +150,9 @@ def main(argv: list[str] | None = None) -> int:
 
     info = build(Path(args.output), interpreter=args.interpreter)
     print(f"built {info['path']}")
-    print(f"  size:   {info['size_bytes']} bytes")
-    print(f"  sha256: {info['sha256']}")
+    print(f"  size:    {info['size_bytes']} bytes")
+    print(f"  files:   {info['file_count']}")
+    print(f"  sha256:  {info['sha256']}")
     print(f"  sidecar: {info['sidecar']}")
     return 0
 
