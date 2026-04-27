@@ -113,6 +113,8 @@ Confirmed: an alias declared `substrate = "dlmopen_isolated"` routes through a f
 
 Confirmed-temporal: a late-arriving alias doesn't retroactively perturb an already-loaded module. Isolation holds across the process lifetime, not just across the namespace. (Test: `tests/10_breakers/test_late_alias_does_not_corrupt_earlier.py`.)
 
+Confirmed-metadata: `importlib.metadata` queries from inside an alias resolve against that alias's vault `dist-info` — not the host venv's installed package, and not a sibling alias's. Modern packages compute `__version__` (and increasingly entry points and feature flags) via `importlib.metadata.version(__name__)` rather than a hardcoded string; click 8.3+ does this and prints a deprecation warning telling callers to switch. Without this, two aliases of one dist would both report whichever version happens to be installed in the host venv, silently collapsing the diamond-conflict story for any metadata-driven tool. The `VaultFinder` walks the call stack to determine which alias namespace is asking and yields a `PathDistribution` rooted at that alias's vault `dist-info`; outside any alias scope it declines and the host's standard finders resolve normally. (Test: `tests/10_breakers/test_metadata_per_alias.py`.)
+
 ### Recorded lockfiles
 
 A run with `--lock script.lock` writes the closure that *actually loaded*. No separate `bubble lock` command. Reproducibility comes from observation, not declaration.
