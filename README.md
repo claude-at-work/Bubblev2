@@ -66,6 +66,10 @@ Plus a self-portrait, with a closed feedback loop:
 bubble run script.py --isolate
 bubble run script.py --isolate --lock script.lock     # record what actually loaded
 
+# Bridge mode: route Python to main bubble, JS/TS to legacy bubble
+bubble bridge tool.py --fetch
+bubble bridge worker.ts --allow-legacy-network
+
 # Explicit version pinning + multi-version aliases via scope manifest
 bubble run script.py --scope versions.toml
 
