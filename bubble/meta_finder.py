@@ -163,6 +163,7 @@ class VaultFinder(importlib.abc.MetaPathFinder):
 
     def _alias_vault_path(self, real_name, version, wheel_tag) -> Optional[Path]:
         from . import config
+        from .vault import store
         if not config.VAULT_DB.exists():
             return None
         try:
@@ -171,12 +172,12 @@ class VaultFinder(importlib.abc.MetaPathFinder):
             return None
         try:
             row = conn.execute(
-                "SELECT vault_path FROM packages WHERE name=? AND version=? AND wheel_tag=?",
+                "SELECT 1 FROM packages WHERE name=? AND version=? AND wheel_tag=?",
                 (real_name, version, wheel_tag),
             ).fetchone()
         finally:
             conn.close()
-        return Path(row[0]) if row else None
+        return store.vault_path_for(real_name, version, wheel_tag) if row else None
 
     # ───────────────── importlib.metadata per-alias ─────────────────
     #
@@ -476,19 +477,23 @@ class VaultFinder(importlib.abc.MetaPathFinder):
         return True
 
     def _query_vault(self, conn, import_name, normalized):
-        rows = list(conn.execute(
-            "SELECT p.name, p.version, p.wheel_tag, p.vault_path "
+        from .vault import store
+        raw = list(conn.execute(
+            "SELECT p.name, p.version, p.wheel_tag "
             "FROM packages p JOIN top_level t "
             "  ON p.name=t.package AND p.version=t.version AND p.wheel_tag=t.wheel_tag "
             "WHERE t.import_name = ?",
             (import_name,),
         ))
-        if not rows:
-            rows = list(conn.execute(
-                "SELECT name, version, wheel_tag, vault_path FROM packages "
+        if not raw:
+            raw = list(conn.execute(
+                "SELECT name, version, wheel_tag FROM packages "
                 "WHERE name=? OR LOWER(REPLACE(REPLACE(name,'_','-'),'.','-')) = ?",
                 (import_name, normalized),
             ))
+        # vault_path is derived from the PK against the current VAULT_DIR,
+        # not the absolute path baked into the row at vault-add time.
+        rows = [(n, v, t, str(store.vault_path_for(n, v, t))) for n, v, t in raw]
         if not rows:
             return None
         if self._scope:
