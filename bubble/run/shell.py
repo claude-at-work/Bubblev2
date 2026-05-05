@@ -274,42 +274,57 @@ def shell_dir(name: str) -> Path:
     return config.SHELLS_DIR / name
 
 
+def _verify_for_link(pkg_name: str, version: Optional[str],
+                     wheel_tag: Optional[str]) -> None:
+    """Drift-verify a vault entry before linking. Refusal raises RuntimeError
+    and records to host.toml."""
+    if not (version and wheel_tag) or os.environ.get("BUBBLE_VERIFY") == "0":
+        return
+    from .. import host
+    report = store.verify(pkg_name, version, wheel_tag)
+    if report.had_index and not report.clean:
+        target = f"{pkg_name}=={version}@{wheel_tag}"
+        for rel, kind in report.drifted:
+            host.record_failure(kind, target, f"rel={rel}")
+        for rel in report.missing:
+            host.record_failure("vault_drift_missing", target, f"rel={rel}")
+        raise RuntimeError(
+            f"vault drift refusing to link {target}: "
+            f"{len(report.drifted)} modified, {len(report.missing)} missing. "
+            f"Run `bubble vault rehash {pkg_name} {version} {wheel_tag}` "
+            f"to re-record, or `bubble vault remove ...` to drop the entry."
+        )
+
+
+def _rel_symlink(dest: Path, target: Path) -> None:
+    """Emit a relative symlink from dest to target. Replaces dest if present.
+
+    Relative is required for relocatability: a wholesale move of BUBBLE_HOME
+    (vault + shells together) must preserve every link. Bundle/unbundle
+    depends on this property."""
+    if dest.is_symlink() or dest.exists():
+        if dest.is_dir() and not dest.is_symlink():
+            shutil.rmtree(dest)
+        else:
+            dest.unlink()
+    rel_target = os.path.relpath(target, start=dest.parent)
+    os.symlink(rel_target, dest)
+
+
 def _link_package(shell_lib: Path, vault_path: Path, pkg_name: str,
                   *, version: Optional[str] = None,
                   wheel_tag: Optional[str] = None) -> list[str]:
-    """Symlink importable modules from vault_path into shell_lib.
+    """Symlink importable top-levels from vault_path into shell_lib as
+    whole-package links. Returns list of names linked.
 
-    'Importable modules' means top-level entries that don't end in .dist-info.
-    Whole-package symlinks (data files come along for free).
-    Returns list of importable names linked.
-
-    Integrity: when (version, wheel_tag) are provided and BUBBLE_VERIFY!=0,
-    the vault entry is verified before linking. Drift refuses the link and
-    surfaces a `[[failures]]` entry through host.record_failure.
-
-    Relocatability: symlinks are emitted relative to the shell-lib directory,
-    so a wholesale move of BUBBLE_HOME (vault + shells together) preserves
-    every link. The bundle thread depends on this property — without it, an
-    untar on a target machine produces a tree of dangling links. With it,
-    the tree just works at whatever path it was extracted to.
+    The dist-info dir is *not* handled here — call _link_distinfo separately.
+    The split exists so namespace-package merging (where a single import name
+    is contributed by N>1 vault packages) can take a different code path
+    without re-implementing dist-info handling.
     """
     if not store.is_under_vault(vault_path):
         raise ValueError(f"refusing to link from outside the vault: {vault_path}")
-    if version and wheel_tag and os.environ.get("BUBBLE_VERIFY") != "0":
-        from .. import host
-        report = store.verify(pkg_name, version, wheel_tag)
-        if report.had_index and not report.clean:
-            target = f"{pkg_name}=={version}@{wheel_tag}"
-            for rel, kind in report.drifted:
-                host.record_failure(kind, target, f"rel={rel}")
-            for rel in report.missing:
-                host.record_failure("vault_drift_missing", target, f"rel={rel}")
-            raise RuntimeError(
-                f"vault drift refusing to link {target}: "
-                f"{len(report.drifted)} modified, {len(report.missing)} missing. "
-                f"Run `bubble vault rehash {pkg_name} {version} {wheel_tag}` "
-                f"to re-record, or `bubble vault remove ...` to drop the entry."
-            )
+    _verify_for_link(pkg_name, version, wheel_tag)
     linked = []
     shell_lib.mkdir(parents=True, exist_ok=True)
     for entry in vault_path.iterdir():
@@ -319,16 +334,247 @@ def _link_package(shell_lib: Path, vault_path: Path, pkg_name: str,
             # wheel .data dir has scripts/headers/data subtrees; skip the
             # top-level wrapper (entry-points handled separately)
             continue
-        dest = shell_lib / entry.name
-        if dest.exists() or dest.is_symlink():
-            dest.unlink()
-        # Emit a relative symlink: target is computed from dest's parent
-        # to entry, so a relocated tree resolves the link against its
-        # new container instead of dangling at the old absolute path.
-        rel_target = os.path.relpath(entry, start=dest.parent)
-        os.symlink(rel_target, dest)
+        _rel_symlink(shell_lib / entry.name, entry)
         linked.append(entry.name)
     return linked
+
+
+def _link_distinfo(shell_lib: Path, vault_path: Path) -> list[str]:
+    """Symlink every *.dist-info/ from vault_path into shell_lib.
+
+    Without this, importlib.metadata.entry_points() / .distribution() /
+    .version() return nothing inside the shell, because they walk sys.path
+    looking for dist-info dirs and there are none. Anything that uses
+    entry-point metadata at runtime (opentelemetry context loaders,
+    pkg_resources plugins, click commands declared as entry points,
+    pytest plugins) silently sees zero entries before this lands.
+    """
+    if not store.is_under_vault(vault_path):
+        raise ValueError(f"refusing to link dist-info from outside the vault: {vault_path}")
+    linked = []
+    shell_lib.mkdir(parents=True, exist_ok=True)
+    for entry in vault_path.iterdir():
+        if not entry.name.endswith(".dist-info"):
+            continue
+        _rel_symlink(shell_lib / entry.name, entry)
+        linked.append(entry.name)
+    return linked
+
+
+def _merge_dirs(target_dir: Path, contrib_dirs: list[Path]) -> list[str]:
+    """Recursively merge multiple source directories into target_dir.
+
+    For each entry name across the contributions, if multiple contributions
+    have a *directory* of that name, recurse: build target_dir/<name>/ as
+    a real subdir and merge their contents. If only one contribution has
+    it (or the conflicting entries aren't all directories), symlink the
+    single contribution directly. Last-write-wins on file collisions.
+
+    This handles the deeply-nested namespace case (e.g. opentelemetry's
+    exporter/otlp/proto/{common,grpc,http} contributed by three distinct
+    dists) — without recursion, only the first contribution's exporter/
+    dir would be visible, shadowing the others' nested subtrees.
+    """
+    linked: list[str] = []
+    # Build a map: name → list of (source_dir, source_path)
+    by_name: dict[str, list[Path]] = {}
+    for cdir in contrib_dirs:
+        if not cdir.is_dir():
+            continue
+        for entry in cdir.iterdir():
+            by_name.setdefault(entry.name, []).append(entry)
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for name, sources in by_name.items():
+        if len(sources) == 1:
+            _rel_symlink(target_dir / name, sources[0])
+            linked.append(name)
+            continue
+        # Multiple contributions claim this name. If they're all dirs, recurse.
+        if all(s.is_dir() for s in sources):
+            sub_target = target_dir / name
+            if sub_target.is_symlink():
+                sub_target.unlink()
+            _merge_dirs(sub_target, sources)
+            linked.append(name + "/")
+        else:
+            # File collision (or mixed dir/file) — last-write-wins, log.
+            from ..vault import store as _store
+            _store.top_level_contentions.append({
+                "name": name, "kind": "shell_merge_collision",
+                "contributors": [str(s) for s in sources],
+            })
+            _rel_symlink(target_dir / name, sources[-1])
+            linked.append(name)
+    return linked
+
+
+def _link_namespace_merge(shell_lib: Path, top_name: str,
+                          contributions: list[tuple[str, str, str, Path]]) -> list[str]:
+    """When N>1 vault packages contribute the same top-level import name
+    (PEP 420 namespace packages — e.g. opentelemetry from api+sdk+exporter-*),
+    a single dir-level symlink to one of them shadows the rest. Instead,
+    create lib/<top>/ as a real directory and merge each contribution's
+    subentries into it, recursing where multiple contributions agree on
+    intermediate directories.
+
+    Sub-name collisions (two contributions both shipping the same submodule
+    name) are resolved last-write-wins; logged via the existing
+    top_level_contentions audit. The vault's PK already discriminates which
+    distribution claims which import name; this function only handles the
+    namespace case where all contributions are intentional.
+    """
+    target_dir = shell_lib / top_name
+    if target_dir.is_symlink():
+        target_dir.unlink()
+    contrib_dirs: list[Path] = []
+    linked: list[str] = []
+    for pkg_name, version, wheel_tag, vault_path in contributions:
+        _verify_for_link(pkg_name, version, wheel_tag)
+        contrib_dir = vault_path / top_name
+        if contrib_dir.is_dir():
+            contrib_dirs.append(contrib_dir)
+            continue
+        flat = vault_path / f"{top_name}.py"
+        if flat.is_file():
+            target_dir.mkdir(parents=True, exist_ok=True)
+            _rel_symlink(target_dir / f"{top_name}.py", flat)
+            linked.append(f"{top_name}.py")
+    if contrib_dirs:
+        linked.extend(_merge_dirs(target_dir, contrib_dirs))
+    return linked
+
+
+# ──────────────────────── closure + namespace grouping ──────────────────────
+
+
+def _resolve_closure(conn: sqlite3.Connection, specs: list[str],
+                     existing: dict) -> tuple[list[tuple[str, str, str, str]],
+                                              list[str], list[tuple]]:
+    """Expand user specs to the transitive Requires-Dist closure.
+
+    Each spec is 'pkg' or 'pkg==version'. For each, pick the best wheel-tag
+    via best_version, then walk the `dependencies` table to add transitive
+    deps (best-version-resolved) until fixed-point.
+
+    Returns (closure, missing, conflicts) where:
+      - closure: ordered list of (name, version, wheel_tag, vault_path) the
+        shell should pin. Names are deduped — one version per package name,
+        which Python import semantics demand.
+      - missing: specs that didn't resolve to anything in the vault.
+      - conflicts: deps whose closure expansion would replace an already-pinned
+        version with a different one. Each is (name, existing_info, new_info).
+
+    The closure is *empirical* on the vault: it pulls only deps that are
+    actually vaulted. A dep listed in Requires-Dist but absent from `packages`
+    is recorded as a missing spec (with kind shell_pkg_missing) so the
+    operator sees the gap rather than getting a silently-incomplete shell.
+    """
+    closure_by_name: dict[str, tuple[str, str, str, str]] = {}
+    missing: list[str] = []
+    conflicts: list[tuple] = []
+
+    # Seed with existing pins so transitive walks don't try to re-pin them.
+    for pkg_name, info in existing.items():
+        vp = store.vault_path_for(pkg_name, info["version"], info["wheel_tag"])
+        closure_by_name[meta.normalize_name(pkg_name)] = (
+            pkg_name, info["version"], info["wheel_tag"], str(vp),
+        )
+
+    queue: list[tuple[str, Optional[str]]] = []
+    for spec in specs:
+        try:
+            queue.append(parse_spec(spec))
+        except ValueError:
+            missing.append(spec)
+
+    seen_specs: set[tuple[str, Optional[str]]] = set()
+    while queue:
+        pkg, ver_pin = queue.pop(0)
+        if (pkg, ver_pin) in seen_specs:
+            continue
+        seen_specs.add((pkg, ver_pin))
+
+        chosen = best_version(conn, pkg, ver_pin)
+        if not chosen:
+            spec_str = f"{pkg}=={ver_pin}" if ver_pin else pkg
+            missing.append(spec_str)
+            continue
+        version, wheel_tag, vault_path = chosen
+
+        # Resolve to canonical name as recorded in packages table
+        row = conn.execute(
+            "SELECT name FROM packages WHERE name=? OR LOWER(REPLACE(REPLACE(name,'_','-'),'.','-'))=? "
+            "LIMIT 1",
+            (pkg, meta.normalize_name(pkg)),
+        ).fetchone()
+        canonical = row[0] if row else pkg
+        norm = meta.normalize_name(canonical)
+
+        if norm in closure_by_name:
+            existing_tuple = closure_by_name[norm]
+            if (existing_tuple[1], existing_tuple[2]) != (version, wheel_tag):
+                conflicts.append((
+                    canonical,
+                    {"version": existing_tuple[1], "wheel_tag": existing_tuple[2]},
+                    {"version": version, "wheel_tag": wheel_tag},
+                ))
+            continue
+
+        closure_by_name[norm] = (canonical, version, wheel_tag, str(vault_path))
+
+        # Walk this package's deps. dep_version_spec is PEP 508; we ignore
+        # the version constraint and let best_version pick the one we have.
+        # Optional / extra-gated deps are skipped (optional=1) — extras must
+        # be requested explicitly.
+        dep_rows = conn.execute(
+            "SELECT dep_name FROM dependencies "
+            "WHERE package=? AND version=? AND wheel_tag=? "
+            "AND (optional=0 OR optional IS NULL) "
+            "AND (extra IS NULL OR extra='')",
+            (canonical, version, wheel_tag),
+        ).fetchall()
+        for (dep_name,) in dep_rows:
+            queue.append((dep_name, None))
+
+    # Strip the seed entries (they were existing pins, not "linked this run").
+    fresh = [v for k, v in closure_by_name.items()
+             if k not in {meta.normalize_name(n) for n in existing}]
+    return fresh, missing, conflicts
+
+
+def _group_by_top_level(conn: sqlite3.Connection,
+                        closure: list[tuple[str, str, str, str]]
+                        ) -> dict[str, list[tuple[str, str, str, Path]]]:
+    """Group closure entries by their top_level import names.
+
+    Returns {import_name: [(pkg_name, version, wheel_tag, vault_path), ...]}.
+    A name with len > 1 is a namespace-package contribution and routes
+    through _link_namespace_merge; a name with len == 1 routes through
+    _link_package.
+    """
+    by_top: dict[str, list[tuple[str, str, str, Path]]] = {}
+    for pkg_name, version, wheel_tag, vault_path in closure:
+        rows = conn.execute(
+            "SELECT import_name FROM top_level "
+            "WHERE package=? AND version=? AND wheel_tag=?",
+            (pkg_name, version, wheel_tag),
+        ).fetchall()
+        if not rows:
+            # No top_level rows recorded — fall back to walking the vault dir
+            # for non-dist-info entries.
+            vp = Path(vault_path)
+            if vp.is_dir():
+                for entry in vp.iterdir():
+                    if entry.name.endswith(".dist-info") or entry.name.endswith(".data"):
+                        continue
+                    n = entry.name[:-3] if entry.name.endswith(".py") else entry.name
+                    rows = rows + [(n,)] if rows else [(n,)]
+        for (import_name,) in rows:
+            by_top.setdefault(import_name, []).append(
+                (pkg_name, version, wheel_tag, Path(vault_path))
+            )
+    return by_top
 
 
 def _link_entry_points(shell_bin: Path, vault_path: Path, python: str) -> list[str]:
@@ -370,10 +616,22 @@ def create(name: str, specs: list[str], *, exist_ok: bool = False) -> Path:
 
 
 def add(name: str, specs: list[str]) -> dict:
-    """Add packages to an existing shell.
+    """Add packages to an existing shell, with full closure resolution.
 
-    Each spec is 'pkg' or 'pkg==version'. Picks the best wheel-tag for the
-    runner; raises if no compatible tag found.
+    Each spec is 'pkg' or 'pkg==version'. The closure is expanded by walking
+    the `dependencies` table (Requires-Dist) until fixed-point, so passing a
+    single spec like 'rich-cli' produces a shell whose closure includes
+    click, rich, pygments, etc. — anything reachable through the dep graph
+    that's vaulted.
+
+    Where N>1 vaulted packages contribute the same top-level import name
+    (PEP 420 namespace packages), the corresponding `lib/<top>/` is built as
+    a real directory of subdir-symlinks rather than a single dir-level
+    symlink that would shadow all but one contribution.
+
+    Each pinned package's *.dist-info/ is also linked into lib/, so
+    importlib.metadata sees the same set of distributions inside the shell
+    that the source vault has on disk.
     """
     sd = shell_dir(name)
     if not sd.exists():
@@ -383,37 +641,49 @@ def add(name: str, specs: list[str]) -> dict:
     summary = {"linked": [], "scripts": [], "missing": [], "conflicts": []}
     from .. import host
     try:
-        for spec in specs:
-            pkg, ver = parse_spec(spec)
-            chosen = best_version(conn, pkg, ver)
-            if not chosen:
-                summary["missing"].append(spec)
-                host.record_failure(
-                    "shell_pkg_missing", spec,
-                    f"shell={name}; spec did not resolve in vault",
-                )
+        closure, missing, conflicts = _resolve_closure(conn, specs, pkgs)
+        for m in missing:
+            summary["missing"].append(m)
+            host.record_failure(
+                "shell_pkg_missing", m,
+                f"shell={name}; spec did not resolve in vault",
+            )
+        for pkg_name, existing_info, new_info in conflicts:
+            summary["conflicts"].append((pkg_name, existing_info, new_info))
+            host.record_failure(
+                "shell_version_conflict", pkg_name,
+                f"shell={name}; existing={existing_info}; requested={new_info}",
+            )
+
+        by_top = _group_by_top_level(conn, closure)
+        # Track which (pkg, version, wheel_tag) tuples we've actually linked
+        # into a top-level so we don't double-link entry-points / dist-info.
+        linked_pkgs: set[tuple[str, str, str]] = set()
+
+        for top_name, contribs in by_top.items():
+            if len(contribs) == 1:
+                pkg_name, version, wheel_tag, vp = contribs[0]
+                linked_names = _link_package(sd / "lib", vp, pkg_name,
+                                             version=version, wheel_tag=wheel_tag)
+                linked_pkgs.add((pkg_name, version, wheel_tag))
+                summary["linked"].append((pkg_name, version, wheel_tag, len(linked_names)))
+            else:
+                _link_namespace_merge(sd / "lib", top_name, contribs)
+                for pkg_name, version, wheel_tag, _vp in contribs:
+                    linked_pkgs.add((pkg_name, version, wheel_tag))
+
+        # dist-info + entry points run once per package, regardless of whether
+        # the package shipped via single-link or namespace-merge.
+        for pkg_name, version, wheel_tag, vp in closure:
+            if (pkg_name, version, wheel_tag) not in linked_pkgs:
                 continue
-            version, wheel_tag, vault_path = chosen
-            existing = pkgs.get(pkg)
-            if existing and (existing["version"] != version
-                             or existing["wheel_tag"] != wheel_tag):
-                summary["conflicts"].append(
-                    (pkg, existing, {"version": version, "wheel_tag": wheel_tag})
-                )
-                host.record_failure(
-                    "shell_version_conflict", pkg,
-                    f"shell={name}; existing={existing}; requested="
-                    f"{{'version':'{version}','wheel_tag':'{wheel_tag}'}}",
-                )
-                continue
-            linked = _link_package(sd / "lib", Path(vault_path), pkg,
-                                   version=version, wheel_tag=wheel_tag)
-            scripts = _link_entry_points(sd / "bin", Path(vault_path),
+            _link_distinfo(sd / "lib", Path(vp))
+            scripts = _link_entry_points(sd / "bin", Path(vp),
                                          python=str(sd / "python"))
-            store.touch(pkg, version, wheel_tag)
-            pkgs[pkg] = {"version": version, "wheel_tag": wheel_tag}
-            summary["linked"].append((pkg, version, wheel_tag, len(linked)))
+            store.touch(pkg_name, version, wheel_tag)
+            pkgs[pkg_name] = {"version": version, "wheel_tag": wheel_tag}
             summary["scripts"].extend(scripts)
+
         _write_manifest(sd, name, pkgs)
         conn.execute(
             "UPDATE shells SET last_used_at=? WHERE name=?",
@@ -469,6 +739,7 @@ def add_pinned(name: str, pkg_name: str, version: str, wheel_tag: str) -> dict:
             return summary
         linked = _link_package(sd / "lib", Path(vault_path), pkg_name,
                                version=version, wheel_tag=wheel_tag)
+        _link_distinfo(sd / "lib", Path(vault_path))
         scripts = _link_entry_points(sd / "bin", Path(vault_path),
                                      python=str(sd / "python"))
         store.touch(pkg_name, version, wheel_tag)
@@ -496,13 +767,13 @@ def remove_packages(name: str, pkgs: list[str]) -> list[str]:
         if p not in manifest:
             continue
         # Unlink whatever we linked; we don't track which entries belonged to
-        # which package, so re-derive from the vault path.
+        # which package, so re-derive from the vault path. Both importable
+        # top-levels and dist-info dirs are linked in by add()/add_pinned;
+        # both must be cleaned up here.
         info = manifest.pop(p)
         vault_path = Path(store.vault_path_for(p, info["version"], info["wheel_tag"]))
         if vault_path.exists():
             for entry in vault_path.iterdir():
-                if entry.name.endswith(".dist-info"):
-                    continue
                 target = sd / "lib" / entry.name
                 if target.is_symlink() and Path(os.readlink(target)) == entry:
                     target.unlink()
