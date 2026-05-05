@@ -76,12 +76,18 @@ def has(conn: sqlite3.Connection, name: str, version: str, wheel_tag: str) -> bo
 
 
 def find_versions(conn: sqlite3.Connection, name: str) -> list[tuple[str, str, str]]:
-    """Return [(version, wheel_tag, vault_path), ...] for a package name."""
-    return list(conn.execute(
-        "SELECT version, wheel_tag, vault_path FROM packages WHERE name=? "
+    """Return [(version, wheel_tag, vault_path), ...] for a package name.
+
+    vault_path is computed from the PK against the current VAULT_DIR, not
+    read from the row — the stored column was baked at vault-add time and
+    becomes wrong if the vault is later moved/symlinked. The PK is the
+    canonical address; the path is just (PK joined to VAULT_DIR)."""
+    rows = conn.execute(
+        "SELECT version, wheel_tag FROM packages WHERE name=? "
         "ORDER BY version DESC, wheel_tag",
         (name,),
-    ).fetchall())
+    ).fetchall()
+    return [(v, t, str(vault_path_for(name, v, t))) for v, t in rows]
 
 
 def stage_dir() -> Path:
@@ -607,14 +613,14 @@ def verify(name: str, version: str, wheel_tag: str) -> VerifyReport:
 def remove(name: str, version: str, wheel_tag: str) -> bool:
     """Delete a vault entry and its tree."""
     conn = db.connect()
-    row = conn.execute(
-        "SELECT vault_path FROM packages WHERE name=? AND version=? AND wheel_tag=?",
+    exists = conn.execute(
+        "SELECT 1 FROM packages WHERE name=? AND version=? AND wheel_tag=?",
         (name, version, wheel_tag),
     ).fetchone()
-    if not row:
+    if not exists:
         conn.close()
         return False
-    path = Path(row[0])
+    path = vault_path_for(name, version, wheel_tag)
     conn.execute(
         "DELETE FROM packages WHERE name=? AND version=? AND wheel_tag=?",
         (name, version, wheel_tag),
@@ -627,17 +633,21 @@ def remove(name: str, version: str, wheel_tag: str) -> bool:
 
 
 def list_all(conn: Optional[sqlite3.Connection] = None) -> list[tuple]:
-    """Return rows from packages table."""
+    """Return rows from packages table.
+
+    vault_path is computed from the PK against the current VAULT_DIR; see
+    find_versions for the rationale."""
     own = conn is None
     if own:
         conn = db.connect()
     rows = list(conn.execute(
-        "SELECT name, version, wheel_tag, has_native, source, cached_at, vault_path "
+        "SELECT name, version, wheel_tag, has_native, source, cached_at "
         "FROM packages ORDER BY name, version"
     ))
     if own:
         conn.close()
-    return rows
+    return [(n, v, t, native, src, cached, str(vault_path_for(n, v, t)))
+            for n, v, t, native, src, cached in rows]
 
 
 def touch(name: str, version: str, wheel_tag: str) -> None:
