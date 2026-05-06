@@ -10,6 +10,8 @@ from pathlib import Path
 
 from . import config
 from . import bridge
+from . import term
+from . import shims
 from .vault import db, store, importer
 from .run import shell as shell_mod
 
@@ -350,23 +352,39 @@ def cmd_setup(args: argparse.Namespace) -> int:
     from . import probe
     import site as _site
     import sys as _sys
+
+    first_run = not config.VAULT_DB.exists()
     config.ensure_dirs()
     db.init_db()
 
+    if first_run:
+        term.out()
+        term.out(f"  {term.bold('◉ bubble')}  {term.dim('first run — getting set up')}")
+        term.out()
+
     # 1. Probe — host portrait + substrate menu.
-    print("probing host...")
+    term.out(f"  {term.dim('◎')} probing host...")
     results = probe.run_all()
     out_path = probe.host_toml_path()
     probe.write(out_path, results)
     py = results["python"]
     k = results["kernel"]
-    print(f"  python {py['version']}  {k['system']} {k['machine']}")
+    py_line = f"python {py['version']}  {k['system']} {k['machine']}"
+    term.out(f"      {term.dim(py_line)}")
     avail = [s["name"] for s in results["substrates"]
              if s.get("status", "").startswith("available")]
     if avail:
-        print(f"  substrates: {', '.join(avail)}")
+        term.out(f"      {term.dim('substrates: ' + ', '.join(avail))}")
 
-    # 2. Discover every site-packages on this interpreter's view.
+    # 2. Apply shims so first-run HTTPS works on Termux/Alpine/proot.
+    shim_rpt = shims.apply()
+    if shim_rpt.applied:
+        term.out(f"  {term.dim('◎')} ssl certs: {term.dim(str(shim_rpt.cert_file))}")
+    elif shim_rpt.gaps and first_run:
+        term.out(f"  {term.amber('⚠')} ssl certs not found  "
+                 f"{term.dim('(HTTPS may fail; `bubble doctor` for detail)')}")
+
+    # 3. Discover every site-packages on this interpreter's view.
     candidates: set[Path] = set()
     for p in _sys.path:
         if "packages" in p:
@@ -384,34 +402,41 @@ def cmd_setup(args: argparse.Namespace) -> int:
                   if bubble_home not in p.parents and p != bubble_home}
 
     if not candidates:
-        print("\nno site-packages directories on this interpreter's path.")
-        print("nothing to scan.  vault is ready at", bubble_home)
+        term.out()
+        term.out(f"  {term.dim('no site-packages directories on this interpreter path.')}")
+        term.out(f"  {term.green('◉')} vault ready: {term.dim(str(bubble_home))}")
         return 0
 
-    # 3. Import each, hardlinking by default (falls back to copy on EXDEV).
-    print(f"\nscanning {len(candidates)} site-packages director"
-          f"{'y' if len(candidates) == 1 else 'ies'}...")
+    # 4. Import each, hardlinking by default (falls back to copy on EXDEV).
+    term.out()
+    sp_word = "directory" if len(candidates) == 1 else "directories"
+    term.out(f"  {term.dim('◎')} scanning {len(candidates)} site-packages {sp_word}...")
     totals = {"imported": 0, "skipped": 0, "errors": 0, "missing_record": 0}
     for sp in sorted(candidates):
         n_dists = len(list(sp.glob("*.dist-info")))
-        print(f"  {sp}  ({n_dists} dists)")
+        term.out(f"      {term.dim(str(sp))}  {term.dim(f'({n_dists} dists)')}")
         r = importer.import_site_packages(sp, hardlink=True, overwrite=False)
         for k_ in totals:
             totals[k_] += r.get(k_, 0)
 
-    # 4. Report what's ready.
-    print(f"\nvault ready: {bubble_home}")
-    print(f"  imported now:    {totals['imported']}")
-    print(f"  already vaulted: {totals['skipped']}")
+    # 5. Report what's ready, then a tiny menu.
+    term.out()
+    term.out(f"  {term.green('◉')} vault ready: {term.dim(str(bubble_home))}")
+    term.out(f"      {term.dim('imported now:    ')}{totals['imported']}")
+    term.out(f"      {term.dim('already vaulted: ')}{totals['skipped']}")
     if totals["missing_record"]:
-        print(f"  no RECORD file:  {totals['missing_record']}  (silent skip)")
+        term.out(f"      {term.dim('no RECORD file:  ')}{totals['missing_record']}  "
+                 f"{term.dim('(silent skip)')}")
     if totals["errors"]:
-        print(f"  errors:          {totals['errors']}")
-    print()
-    print("try:")
-    print("  bubble vault list                 # see what's vaulted")
-    print("  bubble run your-script.py         # vault-only by default")
-    print("  bubble run your-script.py --fetch # allow PyPI fallback")
+        term.out(f"      {term.amber('errors:          ')}{totals['errors']}")
+
+    term.out()
+    term.out(f"  {term.cyan('bubble run <script.py>'):<48}  {term.dim('run a script')}")
+    term.out(f"  {term.cyan('bubble vault get <pkg>'):<48}  {term.dim('pre-cache a package')}")
+    term.out(f"  {term.cyan('bubble status'):<48}  {term.dim('what is in the vault')}")
+    term.out(f"  {term.cyan('bubble doctor'):<48}  {term.dim('diagnose environment')}")
+    term.out(f"  {term.cyan('bubble preflight <script.py>'):<48}  {term.dim('offline-readiness check')}")
+    term.out()
     return 0 if totals["errors"] == 0 else 2
 
 
@@ -450,19 +475,57 @@ def cmd_run(args: argparse.Namespace) -> int:
     set BUBBLE_AUTOFETCH=1) to allow vault misses to escalate to PyPI.
     The strict default keeps every run sovereign — same script, same
     bytes, no silent network.
+
+    On a TTY (and unless --no-preflight is set or --fetch is already
+    granting network), a brief pre-flight scan surfaces missing deps
+    and offers to pre-cache them. Non-TTY contexts skip automatically.
     """
     db.init_db()
     script = Path(args.script).resolve()
     if not script.exists():
-        print(f"error: script not found: {script}", file=sys.stderr)
+        term.err(f"  {term.red('✗')} not found: {script}")
         return 1
+
+    # SSL on Termux/proot/Alpine — keep HTTPS working without further config.
+    shims.apply()
+
+    if term.is_tty() and not term.is_quiet():
+        term.out()
+        term.out(f"  {term.dim('◎')} {term.cyan(script.name)}")
+
+    autofetch = bool(args.fetch) or bool(os.environ.get("BUBBLE_AUTOFETCH"))
+
+    # Pre-flight: only on a TTY, only when not skipped, only when not already
+    # granting network (autofetch handles missing deps via the meta-finder).
+    if (term.is_tty() and not term.is_quiet()
+            and not getattr(args, "no_preflight", False)
+            and not autofetch):
+        from .scanner import py as scanner_py, resolver as resolver_mod
+        try:
+            iset = scanner_py.scan(script)
+        except ValueError:
+            iset = None
+        if iset is not None:
+            plan = resolver_mod.resolve(iset)
+            if plan.missing:
+                term.out(f"  {term.amber('⚠')} missing: "
+                         f"{', '.join(sorted(plan.missing))}")
+                if term.prompt_yn("Fetch from PyPI and cache?"):
+                    from .vault import fetcher
+                    for pkg in sorted(plan.missing):
+                        term.out(f"  {term.dim('◎')} fetching {term.amber(pkg)} ...")
+                        try:
+                            fetcher.fetch_into_vault(pkg)
+                        except (RuntimeError, ValueError, FileNotFoundError) as exc:
+                            term.out(f"      {term.dim('→')} "
+                                     f"could not pre-fetch {pkg}: {term.dim(str(exc))}")
+                    autofetch = True  # let the finder fall through for any still-missing transitives
 
     from .meta_finder import install, _load_scope, _load_aliases
     scope = aliases = None
     if args.scope:
         scope = _load_scope(Path(args.scope))
         aliases = _load_aliases(Path(args.scope))
-    autofetch = bool(args.fetch) or bool(os.environ.get("BUBBLE_AUTOFETCH"))
     finder = install(
         scope=scope or None,
         aliases=aliases or None,
@@ -494,8 +557,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if args.lock:
         _write_lockfile(Path(args.lock), finder.hits)
         if args.verbose:
-            print(f"  wrote lockfile: {args.lock} ({len(finder.hits)} entries)",
-                  file=sys.stderr)
+            term.err(f"  wrote lockfile: {args.lock} ({len(finder.hits)} entries)")
     return rc
 
 
@@ -635,13 +697,156 @@ def cmd_shell_unbundle(args: argparse.Namespace) -> int:
     return 0
 
 
+# ─────────────────────────── human-surface commands ─────────────────────
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """bubble doctor — one-screen environment health.
+
+    Adapted from legacy. Reads vault stats, host portrait, shim state,
+    and tool availability into a single ASCII tree.
+    """
+    from . import doctor as doctor_mod
+    return doctor_mod.run()
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    """bubble preflight <script.py> — offline-readiness shopping list."""
+    from . import preflight as preflight_mod
+    return preflight_mod.run(Path(args.script))
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """bubble status — glance-able vault overview."""
+    if not config.VAULT_DB.exists():
+        term.out()
+        term.out(f"  {term.bold('◉ bubble')}  {term.dim('vault is empty')}")
+        term.out()
+        term.out(f"  {term.cyan('bubble setup'):<48}  {term.dim('import existing site-packages')}")
+        term.out(f"  {term.cyan('bubble vault get <pkg>'):<48}  {term.dim('pre-cache a package')}")
+        term.out()
+        return 0
+    db.init_db()
+    conn = db.connect()
+    try:
+        n_pkgs = conn.execute("SELECT COUNT(*) FROM packages").fetchone()[0]
+        n_native = conn.execute(
+            "SELECT COUNT(*) FROM packages WHERE has_native=1"
+        ).fetchone()[0]
+        n_mods = conn.execute("SELECT COUNT(*) FROM modules").fetchone()[0]
+        n_tl = conn.execute("SELECT COUNT(*) FROM top_level").fetchone()[0]
+        n_shells = conn.execute("SELECT COUNT(*) FROM shells").fetchone()[0]
+    finally:
+        conn.close()
+    # Dedup by (st_dev, st_ino) so hardlinked blobs count once — otherwise
+    # status overstates disk usage by ~3-5x in a hardlinked vault.
+    size_bytes = 0
+    if config.VAULT_DIR.exists():
+        seen: set[tuple[int, int]] = set()
+        for f in config.VAULT_DIR.rglob("*"):
+            try:
+                if not f.is_file() or f.is_symlink():
+                    continue
+                st = f.stat()
+                key = (st.st_dev, st.st_ino)
+                if key in seen:
+                    continue
+                seen.add(key)
+                size_bytes += st.st_size
+            except OSError:
+                continue
+    pure = n_pkgs - n_native
+    term.out()
+    term.out(f"  {term.bold('◉ bubble')}  {term.dim('vault')}")
+    term.out(f"      {n_pkgs} packages "
+             f"{term.dim(f'({pure} pure, {n_native} native)')}, "
+             f"{size_bytes / (1024 * 1024):.1f} MB")
+    term.out(f"      {n_mods:,} modules, {n_tl:,} import names indexed")
+    term.out(f"      {n_shells} shell{'s' if n_shells != 1 else ''}")
+    term.out()
+    return 0
+
+
+def cmd_clean(args: argparse.Namespace) -> int:
+    """bubble clean — dissolve ephemeral bubbles + clear vault staging.
+
+    Two cleanup targets:
+      - $BUBBLE_HOME/bubbles/* — leftover trees from `bubble up --keep`.
+      - $BUBBLE_HOME/vault/.staging/* — abandoned staging dirs from
+        interrupted vault adds.
+    Shells are NOT touched here — they are user-named and persistent.
+    """
+    import shutil
+    n_bubbles = 0
+    n_staging = 0
+    bubbles_dir = config.BUBBLES_DIR
+    staging_dir = config.STAGING_DIR
+
+    if bubbles_dir.exists():
+        for d in list(bubbles_dir.iterdir()):
+            if d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
+                n_bubbles += 1
+    if staging_dir.exists():
+        for d in list(staging_dir.iterdir()):
+            if d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
+                n_staging += 1
+
+    term.out()
+    if n_bubbles == 0 and n_staging == 0:
+        term.out(f"  {term.green('◉')} {term.dim('nothing to clean')}")
+    else:
+        term.out(f"  {term.green('◉')} cleaned: "
+                 f"{n_bubbles} ephemeral bubble{'s' if n_bubbles != 1 else ''}, "
+                 f"{n_staging} staging dir{'s' if n_staging != 1 else ''}")
+    term.out()
+    return 0
+
+
+def cmd_default(args: argparse.Namespace) -> int:
+    """No-args greeting. Show a tiny menu of where to start."""
+    from . import __version__
+    term.out()
+    term.out(f"  {term.bold('◉ bubble')}  {term.dim('v' + __version__)}")
+    if config.VAULT_DB.exists():
+        try:
+            conn = db.connect()
+            n_pkgs = conn.execute("SELECT COUNT(*) FROM packages").fetchone()[0]
+            conn.close()
+            term.out(f"      {term.dim(f'{n_pkgs} packages vaulted')}")
+        except Exception:
+            pass
+    else:
+        term.out(f"      {term.dim('vault not yet initialized — run `bubble setup`')}")
+    term.out()
+    term.out(f"  {term.cyan('bubble run <script.py>'):<48}  {term.dim('run a script')}")
+    term.out(f"  {term.cyan('bubble vault get <pkg>'):<48}  {term.dim('pre-cache a package')}")
+    term.out(f"  {term.cyan('bubble status'):<48}  {term.dim('what is in the vault')}")
+    term.out(f"  {term.cyan('bubble doctor'):<48}  {term.dim('diagnose environment')}")
+    term.out(f"  {term.cyan('bubble preflight <script.py>'):<48}  {term.dim('offline-readiness check')}")
+    term.out(f"  {term.cyan('bubble shell create <name>'):<48}  {term.dim('long-lived bubble')}")
+    term.out(f"  {term.cyan('bubble probe / host'):<48}  {term.dim('machine self-portrait')}")
+    term.out()
+    term.out(f"  {term.dim('flags:')}  "
+             f"{term.dim('-q quiet')}    "
+             f"{term.dim('-y auto-yes')}")
+    term.out()
+    return 0
+
+
 # ───────────────────────────── argument tree ─────────────────────────────
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="bubble",
                                 description="content-addressed package vault + thin runtime views")
-    sub = p.add_subparsers(dest="command", required=True)
+    p.add_argument("--quiet", "-q", action="store_true",
+                   help="suppress UI output (agent / pipe mode); errors still go to stderr")
+    p.add_argument("--yes", "-y", action="store_true",
+                   help="auto-confirm interactive prompts")
+    p.set_defaults(func=cmd_default)
+    sub = p.add_subparsers(dest="command", required=False)
 
     # vault
     vault = sub.add_parser("vault", help="manage the package vault")
@@ -783,8 +988,29 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--lock", help="record actually-loaded closure to this lockfile")
     run.add_argument("--isolate", action="store_true",
                      help="strip system site-packages from sys.path; vault is sole source")
+    run.add_argument("--no-preflight", action="store_true",
+                     help="skip the pre-run scan + interactive offer (TTY only behavior)")
     run.add_argument("--verbose", "-v", action="store_true")
     run.set_defaults(func=cmd_run)
+
+    # doctor — one-screen environment health
+    dr = sub.add_parser("doctor", help="one-screen environment health check")
+    dr.set_defaults(func=cmd_doctor)
+
+    # preflight — offline-readiness shopping list for a script
+    pf = sub.add_parser("preflight",
+        help="given a script, list what's needed to run it offline")
+    pf.add_argument("script")
+    pf.set_defaults(func=cmd_preflight)
+
+    # status — glance-able vault overview
+    sts = sub.add_parser("status", help="glance-able vault overview")
+    sts.set_defaults(func=cmd_status)
+
+    # clean — dissolve ephemeral bubbles + stale staging
+    cl = sub.add_parser("clean",
+        help="dissolve ephemeral bubbles and clear vault staging dirs")
+    cl.set_defaults(func=cmd_clean)
 
     # bridge — route .py to main bubble and .js/.ts to legacy with guardrails
     br = sub.add_parser("bridge",
@@ -809,7 +1035,24 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+
+    # Top-level flags propagate via env so deep call paths (term, prompt_yn,
+    # subprocess invocations) all see them without threading.
+    if getattr(args, "quiet", False):
+        os.environ["BUBBLE_QUIET"] = "1"
+    if getattr(args, "yes", False):
+        os.environ["BUBBLE_AUTOYES"] = "1"
+
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        term.show_cursor()
+        term.out()
+        term.out(f"  {term.amber('⚠')} interrupted")
+        return 130
+    except BrokenPipeError:
+        # Silent — happens when piping to head/less and the consumer closes.
+        return 0
 
 
 if __name__ == "__main__":
@@ -823,27 +1066,40 @@ def cmd_vault_get(args: argparse.Namespace) -> int:
     """bubble vault get <package> [--version V] — download from PyPI into vault."""
     from .vault import fetcher
     db.init_db()
+    shims.apply()  # SSL is needed for the fetch on Termux/proot
     pin = args.version
-    try:
-        result = fetcher.fetch_into_vault(
-            args.package,
-            pinned_version=pin,
-            allow_prerelease=args.prerelease,
-            overwrite=args.overwrite,
-            allow_sdist=args.allow_sdist,
-        )
-    except FileNotFoundError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
-    except (RuntimeError, ValueError) as e:
-        # Sovereignty refusals (sdist, off-host index, name mismatch) and
-        # other fetch-time guardrails. Surface clean to the caller.
-        print(f"error: {e}", file=sys.stderr)
-        return 2
+    pkg_label = args.package + (f"=={pin}" if pin else "")
+
+    err_text: str | None = None
+    err_rc = 0
+    result = None
+    with term.Progress(["fetching"], title=pkg_label) as p:
+        try:
+            result = fetcher.fetch_into_vault(
+                args.package,
+                pinned_version=pin,
+                allow_prerelease=args.prerelease,
+                overwrite=args.overwrite,
+                allow_sdist=args.allow_sdist,
+            )
+        except FileNotFoundError as e:
+            p.fail("not found")
+            err_text, err_rc = str(e), 1
+        except (RuntimeError, ValueError) as e:
+            # Sovereignty refusals (sdist, off-host index, name mismatch).
+            p.fail(str(e)[:60])
+            err_text, err_rc = str(e), 2
+
+    # Stderr writes happen AFTER the bar finalizes — otherwise the live
+    # render thread overwrites them on the next tick.
+    if err_text:
+        term.err(f"  {term.red('✗')} {err_text}")
+        return err_rc
+
     if not result:
-        print(f"already vaulted, or no compatible release for {args.package}"
-              + (f"=={pin}" if pin else ""))
+        term.out(f"  {term.dim('—')} already vaulted or no compatible release for {pkg_label}")
         return 0
     name, version, tag = result
-    print(f"  ✓ vaulted {name}=={version} ({tag})")
+    term.out(f"  {term.green('✓')} vaulted "
+             f"{term.cyan(f'{name}=={version}')}  {term.dim(f'({tag})')}")
     return 0

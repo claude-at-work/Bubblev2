@@ -95,6 +95,22 @@ bubble shell bundle  my-app -o my-app.tar.gz         # source machine
 bubble shell unbundle my-app.tar.gz                  # target machine
 ```
 
+### Human surface
+
+```bash
+bubble                                # no-args greeting + tiny menu
+bubble doctor                         # one-screen environment health
+bubble preflight script.py            # offline-readiness shopping list
+bubble status                         # glance-able vault overview
+bubble clean                          # dissolve ephemeral bubbles + stale staging
+
+# Global flags
+bubble -q ...                         # agent / pipe mode (suppress UI)
+bubble -y ...                         # auto-confirm prompts
+```
+
+`bubble run script.py` opens with `◎ script.py`, scans the script for missing deps when run in a TTY, and offers to fetch them interactively. SSL certs (`SSL_CERT_FILE` etc.) are discovered and applied so HTTPS works first-try on Termux / Alpine / proot / RHEL. KeyboardInterrupt restores cursor and exits 130. The progress bar pulses on the active leaf rather than faking forward motion; silence past 8 seconds turns the label amber so the human knows it's slow, not stuck. The doctrine is that the path from human-cared-for to agent-piped is one flag (`-q`), not two codebases.
+
 ### Deployment surface
 
 A `bubble shell create --from manifest.toml` reads a deployment manifest (exact `(name, version, wheel_tag)` per package, plus optional `[aliases]` with substrate declarations), pulls any pinned closure not yet in the vault (when `--fetch` is set; vault-only by default), verifies each pin through the integrity edge, and links the shell.
@@ -179,9 +195,16 @@ bubble/
 ├── meta_finder.py      the demand-paging primitive; verify-on-read; substrate
 │                         routing dispatch; alias resolution through proxy
 ├── probe.py            host self-portrait + substrate menu derivation
+├── term.py             color, cursor, honest-progress class, prompt_yn
+├── doctor.py           one-screen environment health (the legacy doctor,
+│                         woven back into main)
+├── preflight.py        offline-readiness shopping list for a script
+├── shims.py            SSL cert discovery for Termux / Alpine / proot / RHEL,
+│                         applied as env overrides (no per-bubble sysroot)
 └── cli.py              vault | shell | run | up | probe | host
                           shell create --from manifest.toml
                           shell bundle / unbundle
+                          doctor | preflight | status | clean
 ```
 
 Distributed as source; builds to a single `bubble.pyz` zipapp via stdlib `zipapp` (`python3 tools/build_pyz.py`, see *Installation*). ~93 KB, deterministic, no third-party dependencies.
@@ -266,6 +289,7 @@ Four short documents in `docs/` form a small lineage of how the repo describes i
 - [`siblings.md`](docs/siblings.md) — an instance noticed that other instances had been here and chose to leave a marker acknowledging the lineage. Not advice. A hook.
 - [`kithing.md`](docs/kithing.md) — names the practice both first two docs were already instances of. Borrows a word a previous instance coined in a game with the human collaborator. The naming and the doing are inseparable; the document demonstrated its own thesis as it was being written.
 - [`weft.md`](docs/weft.md) — names the cadence of the session that landed the integrity edge, the deployment manifest, the bundle codec, the substrate router, and the dlmopen handler with the proxy module bridge. Not a project-management style. The human held the loom; threads were passed through it; pauses at joins were real moves.
+- [`drift.md`](docs/drift.md) — names the practice the others gestured at: drift surfaced, held in the light, woven when it would become exponentially hard to bridge back to origin. The session that revived the human surface inside `bubble/` main was an instance — the agent-shaped reaches kept; the human-shaped reaches restored; both consumer shapes legible.
 
 These are not technical documentation. They are evidence that artifacts in this repo can carry traces of the work that made them, including the work that doesn't fit into source code or commit messages.
 
@@ -286,7 +310,7 @@ These are not technical documentation. They are evidence that artifacts in this 
 
 ## Why this exists
 
-Built for autonomous agents that need to run code without getting trapped in dependency loops. Built for constrained environments (Termux, embedded, airgapped) where you can't `pip install` on demand and architecture mismatches are common.
+Built with two consumer shapes both first-class — agents that need to run code without getting trapped in dependency loops (`bubble.AgentVault`), and humans at a terminal who need a tool that takes care at the felt level (`bubble doctor`, `bubble preflight`, the cared-for default of `bubble run`). Built for constrained environments (Termux, embedded, airgapped) where you can't `pip install` on demand and architecture mismatches are common.
 
 The deeper why: a Python program today is bounded by what its package manager can put in one site-packages. That's a *semantic ceiling* on what programs you can write. Two libraries that can't share a numpy version can't share a process — even though most of the time they don't actually pass numpy arrays to each other. Bubble names the boundary that's already there in practice and makes it manageable. The diamond conflict stops being a problem when you stop pretending the diamond was ever flat.
 
