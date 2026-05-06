@@ -207,42 +207,96 @@ class VaultFinder(importlib.abc.MetaPathFinder):
     # importlib.metadata's API has no channel for "who's asking."
     def find_distributions(self, context=None):
         import importlib.metadata as md
-
-        scope_alias = self._caller_alias_scope()
-        if scope_alias is None or scope_alias not in self._aliases:
-            return
-
-        real_name, version, wheel_tag, _sub = self._aliases[scope_alias]
+        from .vault.metadata import normalize_name
 
         requested_name = getattr(context, "name", None) if context is not None else None
-        if requested_name is not None:
-            from .vault.metadata import normalize_name
-            if normalize_name(requested_name) != normalize_name(real_name):
+
+        # Path 1 — alias scope. If we're inside an alias namespace, every
+        # importlib.metadata query resolves against the alias's pinned
+        # vault dist-info, so click_old asking for click's version doesn't
+        # collapse to the host venv's installed version.
+        scope_alias = self._caller_alias_scope()
+        if scope_alias is not None and scope_alias in self._aliases:
+            real_name, version, wheel_tag, _sub = self._aliases[scope_alias]
+            if requested_name is not None and normalize_name(requested_name) != normalize_name(real_name):
                 return
-
-        vault_path = self._alias_vault_path(real_name, version, wheel_tag)
-        if vault_path is None:
+            vault_path = self._alias_vault_path(real_name, version, wheel_tag)
+            if vault_path is None:
+                return
+            candidates = list(vault_path.glob(f"{real_name}-{version}.dist-info"))
+            if not candidates:
+                norm = normalize_name(real_name).replace("-", "_")
+                candidates = list(vault_path.glob(f"{norm}-{version}.dist-info"))
+            if not candidates:
+                candidates = list(vault_path.glob("*.dist-info"))
+            if not candidates:
+                return
+            if self._verbose:
+                sys.stderr.write(
+                    f"[bubble] metadata for {requested_name or '*'} → "
+                    f"{scope_alias} ({real_name}=={version}) "
+                    f"from {candidates[0].name}\n"
+                )
+            yield md.PathDistribution(candidates[0])
             return
 
-        # Distinfo dirs follow `<name>-<version>.dist-info` per PEP 427.
-        # Try the literal name first, then the PEP 503 underscore form.
-        candidates = list(vault_path.glob(f"{real_name}-{version}.dist-info"))
-        if not candidates:
-            from .vault.metadata import normalize_name
-            norm = normalize_name(real_name).replace("-", "_")
-            candidates = list(vault_path.glob(f"{norm}-{version}.dist-info"))
-        if not candidates:
-            candidates = list(vault_path.glob("*.dist-info"))
-        if not candidates:
+        # Path 2 — non-alias vault visibility. Outside any alias scope,
+        # importlib.metadata queries for vaulted packages should resolve
+        # against the vault's dist-info. Issue #13 sub-case 4 in the
+        # in-process path; PR #14 closed it for shells but not for the
+        # AgentVault / meta_finder.install() path that agent embeddings
+        # actually use.
+        if requested_name is not None:
+            vault_path = self._lookup(requested_name)
+            if vault_path is None:
+                return
+            # vault_path is the unpacked dir for the resolved (name, version,
+            # tag); dist-info lives as a sibling there.
+            candidates = list(vault_path.glob(f"{requested_name}-*.dist-info"))
+            if not candidates:
+                norm = normalize_name(requested_name).replace("-", "_")
+                candidates = list(vault_path.glob(f"{norm}-*.dist-info"))
+            if not candidates:
+                candidates = list(vault_path.glob("*.dist-info"))
+            if not candidates:
+                return
+            if self._verbose:
+                sys.stderr.write(
+                    f"[bubble] vault metadata for {requested_name} "
+                    f"from {candidates[0].name}\n"
+                )
+            yield md.PathDistribution(candidates[0])
             return
 
-        if self._verbose:
-            sys.stderr.write(
-                f"[bubble] metadata for {requested_name or '*'} → "
-                f"{scope_alias} ({real_name}=={version}) "
-                f"from {candidates[0].name}\n"
-            )
-        yield md.PathDistribution(candidates[0])
+        # Path 3 — no name requested. importlib.metadata.entry_points()
+        # and similar enumerate-all calls land here. We have to yield
+        # every vaulted distribution's dist-info so the caller can filter
+        # by group / name / etc. Cost: O(#vaulted) per call. opentelemetry's
+        # runtime context loader (entry_points(group="opentelemetry_context"))
+        # is the canonical case where this is load-bearing — without it,
+        # every importlib.metadata-aware runtime hits StopIteration.
+        from . import config
+        if not config.VAULT_DB.exists():
+            return
+        try:
+            conn = sqlite3.connect(str(config.VAULT_DB))
+        except sqlite3.Error:
+            return
+        try:
+            rows = list(conn.execute(
+                "SELECT name, version, wheel_tag FROM packages"
+            ))
+        finally:
+            conn.close()
+        from .vault import store
+        for name, version, wheel_tag in rows:
+            vp = store.vault_path_for(name, version, wheel_tag)
+            if not vp.exists():
+                continue
+            di = list(vp.glob("*.dist-info"))
+            if not di:
+                continue
+            yield md.PathDistribution(di[0])
 
     def _caller_alias_scope(self) -> Optional[str]:
         """Walk the calling frames to find the nearest alias namespace.
