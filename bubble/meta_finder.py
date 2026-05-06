@@ -343,14 +343,49 @@ class VaultFinder(importlib.abc.MetaPathFinder):
             return None
 
         from .substrate import dlmopen as _dlmopen
-        loader = _DlmopenAliasLoader(alias, vault_path, real_name, _dlmopen)
+        dep_paths = self._resolve_dep_paths(alias, real_name, version, wheel_tag)
+        loader = _DlmopenAliasLoader(
+            alias, vault_path, real_name, _dlmopen, dep_paths,
+        )
         spec = importlib.util.spec_from_loader(alias, loader)
         if self._verbose:
             sys.stderr.write(
                 f"[bubble] alias {alias} → dlmopen-isolated: "
-                f"{real_name}=={version} [{wheel_tag}]\n"
+                f"{real_name}=={version} [{wheel_tag}]"
+                f" (+{len(dep_paths)} dep paths)\n"
             )
         return spec
+
+    def _resolve_dep_paths(self, alias: str, real_name: str,
+                           version: str, wheel_tag: str) -> list:
+        """Return the closure of vault paths the isolated interpreter
+        needs on its sys.path so the alias's package can import its
+        dependencies. Missing deps are recorded to host.toml; if
+        autofetch is on we attempt to pull each missing dep first."""
+        from .vault import db as _db, closure as _closure
+        conn = _db.connect()
+        try:
+            cl = _closure.resolve_closure(conn, real_name, version, wheel_tag)
+            if cl.missing and self._autofetch:
+                from .vault import fetcher as _fetcher
+                for dep_name, pinned in cl.missing:
+                    try:
+                        _fetcher.fetch_into_vault(dep_name, pinned_version=pinned)
+                    except Exception:
+                        continue
+                cl = _closure.resolve_closure(conn, real_name, version, wheel_tag)
+            if cl.missing:
+                from . import host as _host
+                for dep_name, pinned in cl.missing:
+                    _host.record_failure(
+                        "vault_dep_missing",
+                        f"{real_name}=={version}",
+                        f"alias={alias} missing dep={dep_name}"
+                        + (f" pinned={pinned}" if pinned else ""),
+                    )
+            return cl.paths
+        finally:
+            conn.close()
 
     def _spec_via_subprocess(self, alias: str, real_name: str,
                              version: str, wheel_tag: str):
@@ -577,14 +612,19 @@ class _DlmopenAliasLoader(importlib.abc.Loader):
     the proxy is already fully formed — no source to execute in the
     caller's interpreter."""
 
-    def __init__(self, alias: str, vault_path, real_name: str, dlmopen_mod):
+    def __init__(self, alias: str, vault_path, real_name: str, dlmopen_mod,
+                 dep_paths=None):
         self._alias = alias
         self._vault_path = vault_path
         self._real = real_name
         self._dlmopen = dlmopen_mod
+        self._dep_paths = dep_paths or []
 
     def create_module(self, spec):
-        return self._dlmopen.load_module(self._alias, self._vault_path, self._real)
+        return self._dlmopen.load_module(
+            self._alias, self._vault_path, self._real,
+            dep_paths=self._dep_paths,
+        )
 
     def exec_module(self, module):
         return None
@@ -729,13 +769,16 @@ def _load_scope(path: Path) -> dict[str, tuple[str, str]]:
     )
 
 
-def _load_aliases(path: Path) -> dict[str, tuple[str, str, str]]:
-    return _load_section(path, "aliases",
-        r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{\s*name\s*=\s*"([^"]+)"\s*,'
-        r'\s*version\s*=\s*"([^"]+)"\s*,'
-        r'\s*wheel_tag\s*=\s*"([^"]+)"\s*\}',
-        lambda g: (g[0], (g[1], g[2], g[3])),
-    )
+def _load_aliases(path: Path) -> dict:
+    """Read the [aliases] section via the canonical manifest parser.
+
+    Returns a dict of alias_name → AliasPin. `install()` already accepts
+    AliasPin objects (it sniffs for `.name` / `.substrate` attrs), so
+    the substrate field flows through to the router unchanged."""
+    from . import manifest as _manifest
+    if not path.exists():
+        return {}
+    return dict(_manifest.load(path).aliases)
 
 
 def _load_section(path: Path, section: str, line_re: str, extract):

@@ -1,0 +1,6 @@
+# bubble deployment manifest
+name = "pydantic-coexist-demo"
+
+[aliases]
+pydantic_v1 = { name = "pydantic", version = "1.10.13", wheel_tag = "py3-none-any", substrate = "dlmopen_isolated" }
+pydantic_v2 = { name = "pydantic", version = "2.11.10", wheel_tag = "py3-none-any", substrate = "dlmopen_isolated" }

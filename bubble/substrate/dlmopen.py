@@ -160,14 +160,20 @@ class DlmopenInterp:
 
     # ─────────────────── pickle-marshalled call channel ────────────────────
 
-    def install_module(self, vault_path: Path, real_module_name: str) -> None:
+    def install_module(self, vault_path: Path, real_module_name: str,
+                       dep_paths: Optional[list] = None) -> None:
         """Make sure `real_module_name` is imported in the isolated
-        interpreter with `vault_path` on its sys.path. Idempotent."""
+        interpreter with `vault_path` (and any `dep_paths`) on its
+        sys.path. Idempotent. Dep paths are inserted ahead of the root
+        so the package can resolve its imports against the vault
+        closure rather than the embedded stdlib alone."""
+        all_paths = [str(p) for p in (dep_paths or [])]
+        all_paths.append(str(vault_path))
         code = (
             f"import sys\n"
-            f"_p = {str(vault_path)!r}\n"
-            f"if _p not in sys.path:\n"
-            f"    sys.path.insert(0, _p)\n"
+            f"for _p in {all_paths!r}:\n"
+            f"    if _p not in sys.path:\n"
+            f"        sys.path.insert(0, _p)\n"
             f"import {real_module_name}\n"
             f"globals()['__bubble_target_{real_module_name}'] = {real_module_name}\n"
         )
@@ -390,7 +396,8 @@ _INTERP_REGISTRY: dict[str, DlmopenInterp] = {}
 
 
 def load_module(alias: str, vault_path: Path,
-                real_module_name: str) -> IsolatedModule:
+                real_module_name: str,
+                dep_paths: Optional[list] = None) -> IsolatedModule:
     """Get or create an isolated interpreter for `alias`, install
     `real_module_name` into it from `vault_path`, return the proxy
     module the caller can use as if it were the real thing.
@@ -404,7 +411,7 @@ def load_module(alias: str, vault_path: Path,
     if interp is None:
         interp = DlmopenInterp()
         _INTERP_REGISTRY[alias] = interp
-    interp.install_module(vault_path, real_module_name)
+    interp.install_module(vault_path, real_module_name, dep_paths=dep_paths)
     return IsolatedModule(alias, interp, vault_path, real_module_name)
 
 
