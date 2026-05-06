@@ -57,6 +57,9 @@ FAILURE_KINDS: set[str] = {
     "shell_pkg_missing",           # spec couldn't resolve in vault
     "shell_version_conflict",      # shell already pins a different version
 
+    # ─ closure resolution (meta_finder._resolve_dep_paths)
+    "vault_dep_missing",           # alias closure asks for a dep not in vault
+
     # ─ runtime (runner.run, meta_finder)
     "wheel_load_segfault",
     "abi_mismatch",

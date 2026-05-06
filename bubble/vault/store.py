@@ -330,7 +330,14 @@ def _discover_top_levels(vault_path: Path) -> list[tuple[str, str]]:
     for entry in sorted(vault_path.iterdir()):
         if entry.name.endswith(".dist-info") or entry.name.endswith(".data"):
             continue
-        if entry.is_dir() and (entry / "__init__.py").exists():
+        if entry.is_dir():
+            # Regular packages (with __init__.py) AND PEP 420 namespace
+            # package contributions (without __init__.py — opentelemetry-*
+            # is the canonical case where 7 dists each ship the same
+            # top-level dir without an __init__.py marker) both count.
+            # Skipping the no-__init__ case made vault discovery blind to
+            # namespace-package contributions — they were vaulted but
+            # invisible to the top_level index.
             found.append((entry.name, digest(entry)))
         elif entry.suffix == ".py" and entry.stem != "__init__":
             found.append((entry.stem, digest(entry)))

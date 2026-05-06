@@ -131,6 +131,17 @@ class VaultFinder(importlib.abc.MetaPathFinder):
         if top in self._aliases:
             return self._spec_for_alias(top)
 
+        # Try the vault first. _untrappable's intent is "don't try to fetch
+        # this from PyPI" — but a name we already vaulted is, by definition,
+        # something we meant to serve, even if it starts with `_` (pytest's
+        # companion `_pytest` is the canonical case).
+        vault_path = self._lookup(top)
+        if vault_path is not None:
+            spec = importlib.machinery.PathFinder.find_spec(top, [str(vault_path)], target)
+            if spec is not None and self._verbose:
+                sys.stderr.write(f"[bubble] {fullname} → {vault_path}\n")
+            return spec
+
         if _untrappable(top):
             return None
         if top in self._fetch_failed:
@@ -147,12 +158,10 @@ class VaultFinder(importlib.abc.MetaPathFinder):
                 return spec
             return None
 
-        vault_path = self._lookup(top)
+        if self._autofetch:
+            vault_path = self._fault_to_pypi(top)
         if vault_path is None:
-            if self._autofetch:
-                vault_path = self._fault_to_pypi(top)
-            if vault_path is None:
-                return None
+            return None
 
         spec = importlib.machinery.PathFinder.find_spec(top, [str(vault_path)], target)
         if spec is not None and self._verbose:
@@ -198,42 +207,96 @@ class VaultFinder(importlib.abc.MetaPathFinder):
     # importlib.metadata's API has no channel for "who's asking."
     def find_distributions(self, context=None):
         import importlib.metadata as md
-
-        scope_alias = self._caller_alias_scope()
-        if scope_alias is None or scope_alias not in self._aliases:
-            return
-
-        real_name, version, wheel_tag, _sub = self._aliases[scope_alias]
+        from .vault.metadata import normalize_name
 
         requested_name = getattr(context, "name", None) if context is not None else None
-        if requested_name is not None:
-            from .vault.metadata import normalize_name
-            if normalize_name(requested_name) != normalize_name(real_name):
+
+        # Path 1 — alias scope. If we're inside an alias namespace, every
+        # importlib.metadata query resolves against the alias's pinned
+        # vault dist-info, so click_old asking for click's version doesn't
+        # collapse to the host venv's installed version.
+        scope_alias = self._caller_alias_scope()
+        if scope_alias is not None and scope_alias in self._aliases:
+            real_name, version, wheel_tag, _sub = self._aliases[scope_alias]
+            if requested_name is not None and normalize_name(requested_name) != normalize_name(real_name):
                 return
-
-        vault_path = self._alias_vault_path(real_name, version, wheel_tag)
-        if vault_path is None:
+            vault_path = self._alias_vault_path(real_name, version, wheel_tag)
+            if vault_path is None:
+                return
+            candidates = list(vault_path.glob(f"{real_name}-{version}.dist-info"))
+            if not candidates:
+                norm = normalize_name(real_name).replace("-", "_")
+                candidates = list(vault_path.glob(f"{norm}-{version}.dist-info"))
+            if not candidates:
+                candidates = list(vault_path.glob("*.dist-info"))
+            if not candidates:
+                return
+            if self._verbose:
+                sys.stderr.write(
+                    f"[bubble] metadata for {requested_name or '*'} → "
+                    f"{scope_alias} ({real_name}=={version}) "
+                    f"from {candidates[0].name}\n"
+                )
+            yield md.PathDistribution(candidates[0])
             return
 
-        # Distinfo dirs follow `<name>-<version>.dist-info` per PEP 427.
-        # Try the literal name first, then the PEP 503 underscore form.
-        candidates = list(vault_path.glob(f"{real_name}-{version}.dist-info"))
-        if not candidates:
-            from .vault.metadata import normalize_name
-            norm = normalize_name(real_name).replace("-", "_")
-            candidates = list(vault_path.glob(f"{norm}-{version}.dist-info"))
-        if not candidates:
-            candidates = list(vault_path.glob("*.dist-info"))
-        if not candidates:
+        # Path 2 — non-alias vault visibility. Outside any alias scope,
+        # importlib.metadata queries for vaulted packages should resolve
+        # against the vault's dist-info. Issue #13 sub-case 4 in the
+        # in-process path; PR #14 closed it for shells but not for the
+        # AgentVault / meta_finder.install() path that agent embeddings
+        # actually use.
+        if requested_name is not None:
+            vault_path = self._lookup(requested_name)
+            if vault_path is None:
+                return
+            # vault_path is the unpacked dir for the resolved (name, version,
+            # tag); dist-info lives as a sibling there.
+            candidates = list(vault_path.glob(f"{requested_name}-*.dist-info"))
+            if not candidates:
+                norm = normalize_name(requested_name).replace("-", "_")
+                candidates = list(vault_path.glob(f"{norm}-*.dist-info"))
+            if not candidates:
+                candidates = list(vault_path.glob("*.dist-info"))
+            if not candidates:
+                return
+            if self._verbose:
+                sys.stderr.write(
+                    f"[bubble] vault metadata for {requested_name} "
+                    f"from {candidates[0].name}\n"
+                )
+            yield md.PathDistribution(candidates[0])
             return
 
-        if self._verbose:
-            sys.stderr.write(
-                f"[bubble] metadata for {requested_name or '*'} → "
-                f"{scope_alias} ({real_name}=={version}) "
-                f"from {candidates[0].name}\n"
-            )
-        yield md.PathDistribution(candidates[0])
+        # Path 3 — no name requested. importlib.metadata.entry_points()
+        # and similar enumerate-all calls land here. We have to yield
+        # every vaulted distribution's dist-info so the caller can filter
+        # by group / name / etc. Cost: O(#vaulted) per call. opentelemetry's
+        # runtime context loader (entry_points(group="opentelemetry_context"))
+        # is the canonical case where this is load-bearing — without it,
+        # every importlib.metadata-aware runtime hits StopIteration.
+        from . import config
+        if not config.VAULT_DB.exists():
+            return
+        try:
+            conn = sqlite3.connect(str(config.VAULT_DB))
+        except sqlite3.Error:
+            return
+        try:
+            rows = list(conn.execute(
+                "SELECT name, version, wheel_tag FROM packages"
+            ))
+        finally:
+            conn.close()
+        from .vault import store
+        for name, version, wheel_tag in rows:
+            vp = store.vault_path_for(name, version, wheel_tag)
+            if not vp.exists():
+                continue
+            di = list(vp.glob("*.dist-info"))
+            if not di:
+                continue
+            yield md.PathDistribution(di[0])
 
     def _caller_alias_scope(self) -> Optional[str]:
         """Walk the calling frames to find the nearest alias namespace.
@@ -343,14 +406,49 @@ class VaultFinder(importlib.abc.MetaPathFinder):
             return None
 
         from .substrate import dlmopen as _dlmopen
-        loader = _DlmopenAliasLoader(alias, vault_path, real_name, _dlmopen)
+        dep_paths = self._resolve_dep_paths(alias, real_name, version, wheel_tag)
+        loader = _DlmopenAliasLoader(
+            alias, vault_path, real_name, _dlmopen, dep_paths,
+        )
         spec = importlib.util.spec_from_loader(alias, loader)
         if self._verbose:
             sys.stderr.write(
                 f"[bubble] alias {alias} → dlmopen-isolated: "
-                f"{real_name}=={version} [{wheel_tag}]\n"
+                f"{real_name}=={version} [{wheel_tag}]"
+                f" (+{len(dep_paths)} dep paths)\n"
             )
         return spec
+
+    def _resolve_dep_paths(self, alias: str, real_name: str,
+                           version: str, wheel_tag: str) -> list:
+        """Return the closure of vault paths the isolated interpreter
+        needs on its sys.path so the alias's package can import its
+        dependencies. Missing deps are recorded to host.toml; if
+        autofetch is on we attempt to pull each missing dep first."""
+        from .vault import db as _db, closure as _closure
+        conn = _db.connect()
+        try:
+            cl = _closure.resolve_closure(conn, real_name, version, wheel_tag)
+            if cl.missing and self._autofetch:
+                from .vault import fetcher as _fetcher
+                for dep_name, pinned in cl.missing:
+                    try:
+                        _fetcher.fetch_into_vault(dep_name, pinned_version=pinned)
+                    except Exception:
+                        continue
+                cl = _closure.resolve_closure(conn, real_name, version, wheel_tag)
+            if cl.missing:
+                from . import host as _host
+                for dep_name, pinned in cl.missing:
+                    _host.record_failure(
+                        "vault_dep_missing",
+                        f"{real_name}=={version}",
+                        f"alias={alias} missing dep={dep_name}"
+                        + (f" pinned={pinned}" if pinned else ""),
+                    )
+            return cl.paths
+        finally:
+            conn.close()
 
     def _spec_via_subprocess(self, alias: str, real_name: str,
                              version: str, wheel_tag: str):
@@ -577,14 +675,19 @@ class _DlmopenAliasLoader(importlib.abc.Loader):
     the proxy is already fully formed — no source to execute in the
     caller's interpreter."""
 
-    def __init__(self, alias: str, vault_path, real_name: str, dlmopen_mod):
+    def __init__(self, alias: str, vault_path, real_name: str, dlmopen_mod,
+                 dep_paths=None):
         self._alias = alias
         self._vault_path = vault_path
         self._real = real_name
         self._dlmopen = dlmopen_mod
+        self._dep_paths = dep_paths or []
 
     def create_module(self, spec):
-        return self._dlmopen.load_module(self._alias, self._vault_path, self._real)
+        return self._dlmopen.load_module(
+            self._alias, self._vault_path, self._real,
+            dep_paths=self._dep_paths,
+        )
 
     def exec_module(self, module):
         return None
@@ -729,13 +832,16 @@ def _load_scope(path: Path) -> dict[str, tuple[str, str]]:
     )
 
 
-def _load_aliases(path: Path) -> dict[str, tuple[str, str, str]]:
-    return _load_section(path, "aliases",
-        r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{\s*name\s*=\s*"([^"]+)"\s*,'
-        r'\s*version\s*=\s*"([^"]+)"\s*,'
-        r'\s*wheel_tag\s*=\s*"([^"]+)"\s*\}',
-        lambda g: (g[0], (g[1], g[2], g[3])),
-    )
+def _load_aliases(path: Path) -> dict:
+    """Read the [aliases] section via the canonical manifest parser.
+
+    Returns a dict of alias_name → AliasPin. `install()` already accepts
+    AliasPin objects (it sniffs for `.name` / `.substrate` attrs), so
+    the substrate field flows through to the router unchanged."""
+    from . import manifest as _manifest
+    if not path.exists():
+        return {}
+    return dict(_manifest.load(path).aliases)
 
 
 def _load_section(path: Path, section: str, line_re: str, extract):
