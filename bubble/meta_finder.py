@@ -131,6 +131,17 @@ class VaultFinder(importlib.abc.MetaPathFinder):
         if top in self._aliases:
             return self._spec_for_alias(top)
 
+        # Try the vault first. _untrappable's intent is "don't try to fetch
+        # this from PyPI" — but a name we already vaulted is, by definition,
+        # something we meant to serve, even if it starts with `_` (pytest's
+        # companion `_pytest` is the canonical case).
+        vault_path = self._lookup(top)
+        if vault_path is not None:
+            spec = importlib.machinery.PathFinder.find_spec(top, [str(vault_path)], target)
+            if spec is not None and self._verbose:
+                sys.stderr.write(f"[bubble] {fullname} → {vault_path}\n")
+            return spec
+
         if _untrappable(top):
             return None
         if top in self._fetch_failed:
@@ -147,12 +158,10 @@ class VaultFinder(importlib.abc.MetaPathFinder):
                 return spec
             return None
 
-        vault_path = self._lookup(top)
+        if self._autofetch:
+            vault_path = self._fault_to_pypi(top)
         if vault_path is None:
-            if self._autofetch:
-                vault_path = self._fault_to_pypi(top)
-            if vault_path is None:
-                return None
+            return None
 
         spec = importlib.machinery.PathFinder.find_spec(top, [str(vault_path)], target)
         if spec is not None and self._verbose:
