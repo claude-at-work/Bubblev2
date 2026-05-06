@@ -12,6 +12,26 @@ That's it. First run pages from PyPI; subsequent runs hit the warm vault. Lockfi
 
 ---
 
+## Try it
+
+```bash
+git clone https://github.com/claude-at-work/Bubblev2.git
+cd Bubblev2
+./demo.sh
+```
+
+Three commands and you're watching pydantic v1 and v2 live in the same Python process — kernel-isolated link namespaces, both `BaseModel` surfaces instantiable, no cross-version contamination. The demo declares the two majors as aliases in `bubble.toml`, `demo.py` imports them by alias, and `demo.sh` runs the canonical command (`python3 -m bubble run demo.py --scope bubble.toml --fetch`) with autofetch on so any missing transitive deps page in from PyPI.
+
+Add `-v` for the verbose substrate-routing log:
+
+```bash
+./demo.sh -v
+```
+
+You'll see each alias announce its substrate (`alias pydantic_v1 → dlmopen-isolated …`) and the closure of vault paths seeded onto each isolated interpreter's `sys.path`. On hosts without `libpython` available for dlmopen, the router downgrades to in-process and records the reason to `host.toml`; the demo surfaces a cross-namespace collision in that case. Install libpython for your Python (e.g. `apt-get install libpython3.13` on Debian/Kali) and re-run for the kernel-isolated path.
+
+---
+
 ## What is this?
 
 Bubble started as ephemeral per-script environments — scan the script, vault what it needs, assemble a symlink tree, run, dissolve. The vision in [the original architecture](#what-stayed-from-the-original) was always module-level isolation: `requests.sessions` from 2.28 in one bubble, `requests.sessions` from 2.33 in another, same machine, no conflict.
