@@ -153,8 +153,12 @@ def cmd_shell_create(args: argparse.Namespace) -> int:
     db.init_db()
     if args.from_manifest:
         return _shell_create_from_manifest(args)
-    sd = shell_mod.create(args.name, args.specs or [], exist_ok=args.exist_ok)
+    parent = getattr(args, "parent", None)
+    sd = shell_mod.create(args.name, args.specs or [], exist_ok=args.exist_ok,
+                          parent=parent)
     print(f"created shell '{args.name}' at {sd}")
+    if parent:
+        print(f"  parent: {parent}")
     if args.specs:
         print(f"  added: {len(args.specs)} package specs")
     return 0
@@ -192,7 +196,8 @@ def _shell_create_from_manifest(args: argparse.Namespace) -> int:
                 print(f"  fetch refused: {exc}", file=sys.stderr)
                 return 2
 
-    sd = shell_mod.create(args.name, [], exist_ok=args.exist_ok)
+    parent = getattr(args, "parent", None)
+    sd = shell_mod.create(args.name, [], exist_ok=args.exist_ok, parent=parent)
     if args.name == m.name or m.name is None:
         pass  # name agrees or unspecified
     elif m.name and m.name != args.name:
@@ -205,25 +210,26 @@ def _shell_create_from_manifest(args: argparse.Namespace) -> int:
         for k in total_summary:
             total_summary[k].extend(s[k])
 
-    # Aliases: record into the shell-state manifest's metadata so future
-    # lookups (and the substrate-routing thread, when it lands) can read
-    # them. We store them under the shell row's metadata JSON for now —
-    # the alias→substrate routing thread is where they become
-    # operational.
-    if m.aliases:
+    # Record aliases (and re-affirm parent if set) into shell metadata.
+    # Scope is already kept in sync by add_pinned(); we only need an
+    # extra write here for the aliases section.
+    if m.aliases or parent:
         conn = db.connect()
         row = conn.execute(
             "SELECT metadata FROM shells WHERE name=?", (args.name,),
         ).fetchone()
         meta_blob = json.loads(row[0]) if row and row[0] else {}
-        meta_blob["aliases"] = {
-            alias: {
-                "name": pin.name,
-                "version": pin.version,
-                "wheel_tag": pin.wheel_tag,
-                "substrate": pin.substrate,
-            } for alias, pin in m.aliases.items()
-        }
+        if m.aliases:
+            meta_blob["aliases"] = {
+                alias: {
+                    "name": pin.name,
+                    "version": pin.version,
+                    "wheel_tag": pin.wheel_tag,
+                    "substrate": pin.substrate,
+                } for alias, pin in m.aliases.items()
+            }
+        if parent:
+            meta_blob["parent"] = parent
         conn.execute(
             "UPDATE shells SET metadata=? WHERE name=?",
             (json.dumps(meta_blob), args.name),
@@ -249,6 +255,80 @@ def _shell_create_from_manifest(args: argparse.Namespace) -> int:
               f"(substrate routing not yet wired; see `bubble host`)")
     if total_summary["missing"] or total_summary["conflicts"]:
         return 2
+    return 0
+
+
+def cmd_project_ingest(args: argparse.Namespace) -> int:
+    """bubble project ingest <dir> --name NAME
+
+    Scan every .py file under <dir>, resolve external imports against the
+    vault, and create (or update) a named shell whose scope is pinned to
+    exactly those versions.  On subsequent runs the shell's BUBBLE_SHELL
+    env var makes VaultFinder enforce the pinned versions for that project.
+    """
+    from . import project as project_mod
+    db.init_db()
+    project_dir = Path(args.dir).resolve()
+    if not project_dir.is_dir():
+        print(f"error: not a directory: {project_dir}", file=sys.stderr)
+        return 1
+
+    parent = getattr(args, "parent", None)
+    try:
+        summary = project_mod.ingest(
+            project_dir,
+            args.name,
+            fetch=bool(getattr(args, "fetch", False)) or bool(os.environ.get("BUBBLE_AUTOFETCH")),
+            overwrite=bool(getattr(args, "overwrite", False)),
+            parent=parent,
+            verbose=getattr(args, "verbose", False),
+        )
+    except (FileExistsError, NotADirectoryError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"project shell '{args.name}' ← {project_dir}")
+    print(f"  scanned:  {summary['scanned_files']} .py files")
+
+    resolved = summary.get("resolved") or {}
+    if resolved:
+        print(f"  resolved: {len(resolved)} distributions")
+
+    if summary.get("missing_imports"):
+        print(f"  missing from vault: {', '.join(sorted(summary['missing_imports']))}")
+        if not getattr(args, "fetch", False):
+            print("  (re-run with --fetch to pull from PyPI)")
+
+    for pkg, ver, tag, n in summary.get("linked") or []:
+        print(f"    + {pkg:<28} {ver:<14} {tag}")
+    if summary.get("scripts"):
+        print(f"  scripts: {', '.join(summary['scripts'])}")
+    if summary.get("conflicts"):
+        for pkg, old, new in summary["conflicts"]:
+            print(f"  CONFLICT {pkg}: shell has {old}, scan wants {new}")
+        return 3
+    if summary.get("scan_errors"):
+        for path, msg in summary["scan_errors"]:
+            print(f"  parse error: {path}: {msg}", file=sys.stderr)
+
+    if parent:
+        print(f"  parent: {parent}  (scope inherited for unlisted packages)")
+    print(f"  shell:    {summary['shell_dir']}")
+    print(f"  marker:   {project_dir / '.bubble-shell'}")
+    return 0 if not summary.get("missing_imports") else 2
+
+
+def cmd_shell_freeze(args: argparse.Namespace) -> int:
+    """bubble shell freeze <name> -o <manifest> — snapshot shell as manifest."""
+    from . import project as project_mod
+    db.init_db()
+    out = Path(args.output).resolve()
+    try:
+        project_mod.freeze(args.name, out)
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"  froze '{args.name}' → {out}")
     return 0
 
 
@@ -905,6 +985,10 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--fetch", action="store_true",
                     help="when --from is set, pull any missing pin from PyPI; "
                          "default is vault-only (fail closed on missing pins)")
+    sc.add_argument("--parent", metavar="SHELL",
+                    help="name of a parent shell; imports not pinned by this "
+                         "shell resolve against the parent's scope (spinoff "
+                         "/ project inheritance)")
     sc.set_defaults(func=cmd_shell_create)
 
     sa = ssub.add_parser("add", help="add packages to a shell")
@@ -938,6 +1022,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="output path for the tar.gz bundle")
     sb.set_defaults(func=cmd_shell_bundle)
 
+    sf = ssub.add_parser("freeze",
+                         help="snapshot a shell's state as a deployment manifest")
+    sf.add_argument("name")
+    sf.add_argument("-o", "--output", required=True,
+                    help="output path for the manifest (.toml)")
+    sf.set_defaults(func=cmd_shell_freeze)
+
     sub_un = ssub.add_parser("unbundle",
                              help="extract a bundle into BUBBLE_HOME, "
                                   "rebuild vault.db, probe, verify")
@@ -946,6 +1037,27 @@ def build_parser() -> argparse.ArgumentParser:
                         help="extract even when source/target python_tag differ "
                              "(verify will still refuse drifted pins)")
     sub_un.set_defaults(func=cmd_shell_unbundle)
+
+    # project — ingest a whole project directory into a named shell
+    proj = sub.add_parser("project",
+                          help="project-level operations (ingest a directory, freeze)")
+    psub = proj.add_subparsers(dest="project_cmd", required=True)
+
+    pi = psub.add_parser("ingest",
+                         help="scan all .py files in a directory and create a "
+                              "named shell pinned to their resolved dependencies")
+    pi.add_argument("dir", help="project directory to scan")
+    pi.add_argument("--name", "-n", required=True,
+                    help="shell name to create / update")
+    pi.add_argument("--parent", metavar="SHELL",
+                    help="name of a parent shell for scope inheritance "
+                         "(spinoff projects)")
+    pi.add_argument("--fetch", action="store_true",
+                    help="pull missing packages from PyPI; default vault-only")
+    pi.add_argument("--overwrite", action="store_true",
+                    help="recreate the shell if it already exists")
+    pi.add_argument("--verbose", "-v", action="store_true")
+    pi.set_defaults(func=cmd_project_ingest)
 
     # up — ephemeral per-script bubble (the original entry point)
     up = sub.add_parser("up", help="scan a script, assemble an ephemeral bubble, run")

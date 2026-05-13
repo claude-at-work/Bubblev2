@@ -64,6 +64,42 @@ class _Visitor(ast.NodeVisitor):
             self.imports.add(node.module)
 
 
+def scan_dir(project_dir: Path) -> "tuple[ImportSet, list[tuple[Path, str]]]":
+    """Walk *project_dir* recursively, AST-scan every .py file, merge results.
+
+    Project-local top-level names (modules / packages that live directly
+    under project_dir as .py files or __init__.py-bearing directories) are
+    excluded from top_level_imports so they are never mistaken for vault
+    dependencies.
+
+    Returns (merged_ImportSet, errors) where errors is a list of
+    (path, message) for files that could not be parsed.
+    """
+    project_dir = Path(project_dir).resolve()
+
+    # Collect the project's own top-level module names so we can exclude them.
+    local_names: set[str] = set()
+    for entry in project_dir.iterdir():
+        if entry.suffix == ".py" and entry.stem not in ("__init__", "__main__"):
+            local_names.add(entry.stem)
+        elif entry.is_dir() and (entry / "__init__.py").exists():
+            local_names.add(entry.name)
+
+    merged = ImportSet(script=project_dir)
+    errors: list[tuple[Path, str]] = []
+    for py_file in sorted(project_dir.rglob("*.py")):
+        try:
+            iset = scan(py_file)
+            merged.top_level_imports |= iset.top_level_imports
+            merged.raw_imports |= iset.raw_imports
+            merged.stdlib_imports |= iset.stdlib_imports
+        except (ValueError, OSError) as exc:
+            errors.append((py_file, str(exc)))
+
+    merged.top_level_imports -= local_names
+    return merged, errors
+
+
 def scan(script_path: Path) -> ImportSet:
     """Walk the AST of a script, collect imports, classify into stdlib/external."""
     script_path = Path(script_path)
