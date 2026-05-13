@@ -16,6 +16,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from .assemble import BubbleEnv
 from ..vault import db, fetcher
@@ -25,6 +26,60 @@ from ..scanner import resolver as resolver_mod, py as scanner_py
 _MODNF_RE = re.compile(r"No module named '([^']+)'")
 
 
+def _prefetch_from_pyproject(script: Optional[Path], verbose: bool = False) -> None:
+    """Bulk-fetch pyproject-declared deps not yet in the vault.
+
+    Called once before the retry loop so that deps missing from the bubble
+    are already available in the vault when the loop reassembles — turning
+    what would be N fault-driven restarts into zero or one.
+
+    Failures are recorded to host.toml but never raise; the retry loop's
+    per-import fault path handles anything that still fails.
+    """
+    from .. import pyproject as _pyproject, host
+    from ..vault import fetcher, store, db as _db
+
+    start = script.parent if (script and script.is_file()) else Path(os.getcwd())
+    manifest = _pyproject.find_manifest(start)
+    if not manifest:
+        return
+
+    dists = _pyproject.parse_deps(manifest)
+    if not dists:
+        return
+
+    _db.init_db()
+    conn = _db.connect()
+    try:
+        missing = [d for d in dists if not store.find_versions(conn, d)]
+    finally:
+        conn.close()
+
+    if not missing:
+        return
+
+    if verbose:
+        print(f"  pyproject prefetch ({manifest.name}): "
+              f"{len(missing)} deps missing — {', '.join(missing)}", file=sys.stderr)
+
+    for dist in missing:
+        if (host.is_known_failure("pypi_fetch_failed", dist) or
+                host.is_known_failure("pypi_no_compatible_release", dist)):
+            if verbose:
+                print(f"  pyproject skip {dist!r}: known failure", file=sys.stderr)
+            continue
+        if verbose:
+            print(f"  pyproject fetching {dist}…", file=sys.stderr)
+        try:
+            fetcher.fetch_into_vault(dist)
+        except (ValueError, RuntimeError) as exc:
+            host.record_failure("pypi_index_refused", dist,
+                                f"pyproject_prefetch: {exc}")
+        except Exception as exc:
+            host.record_failure("pypi_fetch_failed", dist,
+                                f"pyproject_prefetch: {exc}")
+
+
 def run(env: BubbleEnv, cmd: list[str], *,
         max_retries: int = 8, verbose: bool = False) -> int:
     """Execute cmd within env. On ModuleNotFoundError, vault-fetch and retry."""
@@ -32,6 +87,15 @@ def run(env: BubbleEnv, cmd: list[str], *,
     full_env["PYTHONPATH"] = env.pythonpath
     full_env["PATH"] = env.path
     full_env["BUBBLE_DIR"] = str(env.bubble_dir)
+
+    # Pre-fetch any pyproject-declared deps before the first run so that
+    # the retry loop only fires for truly dynamic / unscanned imports.
+    script_path: Optional[Path] = None
+    if len(cmd) >= 2:
+        candidate = Path(cmd[1])
+        if candidate.suffix == ".py" and candidate.exists():
+            script_path = candidate
+    _prefetch_from_pyproject(script_path, verbose=verbose)
 
     retries = 0
     while True:

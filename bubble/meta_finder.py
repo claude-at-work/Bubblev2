@@ -81,6 +81,16 @@ class VaultFinder(importlib.abc.MetaPathFinder):
         # None = not yet loaded; {} = loaded but empty.
         self._shell_scope: Optional[dict[str, tuple[str, str]]] = None
         self._shell_scope_loaded: bool = False
+        # Pyproject manifest state.  On first autofetch fault we locate the
+        # nearest pyproject.toml / requirements.txt / setup.cfg, bulk-fetch
+        # every declared dep that is not yet in the vault, then mark the
+        # prefetch done so subsequent faults skip straight to individual lookup.
+        # Two separate flags: _pyproject_dists_loaded guards the manifest parse
+        # (called eagerly from _dist_from_pyproject too); _pyproject_prefetched
+        # guards the bulk fetch (called once from _fault_to_pypi).
+        self._pyproject_dists_loaded: bool = False
+        self._pyproject_prefetched: bool = False
+        self._pyproject_dists: list[str] = []   # declared dist names (filled once)
 
     @staticmethod
     def _normalize_aliases(aliases: dict) -> dict[str, tuple[str, str, str, Optional[str]]]:
@@ -669,10 +679,123 @@ class VaultFinder(importlib.abc.MetaPathFinder):
                   reverse=True)
         return rows[0]
 
+    # ─────────────────── pyproject prefetch helpers ──────────────────
+
+    def _load_pyproject_dists(self) -> list[str]:
+        """Locate the nearest project manifest and parse its declared deps.
+
+        Searches from the current working directory (and BUBBLE_SHELL_DIR if
+        set). Result is cached on the instance — called at most once per run.
+        """
+        if self._pyproject_dists_loaded:
+            return self._pyproject_dists
+        self._pyproject_dists_loaded = True
+        from . import pyproject as _pyproject
+        # Prefer the project directory associated with the active shell;
+        # fall back to cwd so `bubble run ./script.py` also benefits.
+        start_candidates = [os.getcwd()]
+        shell_dir = os.environ.get("BUBBLE_SHELL_DIR")
+        if shell_dir:
+            start_candidates.insert(0, shell_dir)
+        for start in start_candidates:
+            manifest = _pyproject.find_manifest(Path(start))
+            if manifest:
+                self._pyproject_dists = _pyproject.parse_deps(manifest)
+                if self._verbose and self._pyproject_dists:
+                    sys.stderr.write(
+                        f"[bubble] pyproject manifest: {manifest} "
+                        f"({len(self._pyproject_dists)} declared deps)\n"
+                    )
+                break
+        return self._pyproject_dists
+
+    def _prefetch_pyproject_deps(self) -> None:
+        """Bulk-fetch all declared pyproject deps not yet in the vault.
+
+        Called once on the first autofetch fault so that subsequent imports
+        are served from the vault rather than triggering per-import network
+        round-trips. Failures are recorded to host.toml but never raise —
+        the per-import fault path handles retries.
+        """
+        dists = self._load_pyproject_dists()
+        self._pyproject_prefetched = True
+        if not dists:
+            return
+        from . import pyproject as _pyproject, host
+        from .vault import fetcher, store, db as _db
+        _db.init_db()
+        conn = _db.connect()
+        try:
+            missing = [d for d in dists if not store.find_versions(conn, d)]
+        finally:
+            conn.close()
+        if not missing:
+            return
+        if self._verbose:
+            sys.stderr.write(
+                f"[bubble] pyproject prefetch: {len(missing)} deps missing from vault: "
+                f"{', '.join(missing)}\n"
+            )
+        for dist in missing:
+            if (host.is_known_failure("pypi_fetch_failed", dist) or
+                    host.is_known_failure("pypi_no_compatible_release", dist)):
+                if self._verbose:
+                    sys.stderr.write(
+                        f"[bubble] pyproject skip {dist!r}: known failure\n"
+                    )
+                continue
+            if self._verbose:
+                sys.stderr.write(f"[bubble] pyproject prefetch: {dist}…\n")
+            try:
+                fetcher.fetch_into_vault(dist)
+            except (ValueError, RuntimeError) as exc:
+                host.record_failure("pypi_index_refused", dist,
+                                    f"pyproject_prefetch: {exc}")
+            except Exception as exc:
+                host.record_failure("pypi_fetch_failed", dist,
+                                    f"pyproject_prefetch: {exc}")
+
+    def _dist_from_pyproject(self, import_name: str) -> str:
+        """Check declared pyproject deps for a dist whose PEP 503-normalised
+        name matches *import_name*. Returns the dist name if found, else
+        the original import_name (pass-through).
+
+        This supplements IMPORT_TO_DIST for projects that already declare
+        their deps — e.g. if `beautifulsoup4` is in pyproject.toml we can
+        confirm the `bs4 → beautifulsoup4` mapping even without a vault hit.
+        """
+        from .vault.metadata import normalize_name
+        norm = normalize_name(import_name)
+        for dist in self._load_pyproject_dists():
+            if normalize_name(dist) == norm:
+                return dist
+        return import_name
+
+    # ─────────────────────────── fault path ──────────────────────────
+
     def _fault_to_pypi(self, name: str) -> Optional[Path]:
         from .scanner.py import IMPORT_TO_DIST
         from . import host
+
+        # Step 1: bulk-prefetch all pyproject-declared deps on the first fault.
+        # This converts future per-import faults into vault hits so we only
+        # pay one network scan instead of N restarts.
+        if not self._pyproject_prefetched:
+            self._prefetch_pyproject_deps()
+            # Re-check the vault — prefetch may have just resolved this import.
+            vault_path = self._lookup(name)
+            if vault_path is not None:
+                if self._verbose:
+                    sys.stderr.write(
+                        f"[bubble] {name!r} resolved after pyproject prefetch\n"
+                    )
+                return vault_path
+
+        # Step 2: resolve import_name → dist_name.
+        # Priority: static IMPORT_TO_DIST table, then pyproject declared names.
         dist = IMPORT_TO_DIST.get(name, name)
+        if dist == name:
+            dist = self._dist_from_pyproject(name)
 
         # Cross-run memory. _fetch_failed holds the in-process view; host.toml
         # holds the persistent view. Without this read the function records
