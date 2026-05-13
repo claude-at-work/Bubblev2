@@ -189,7 +189,7 @@ _ACTIVATE_TMPL = """# bubble shell activate — source this from POSIX sh / bash
 # usage: source {shell_dir}/activate
 _BUBBLE_OLD_PYTHONPATH="${{PYTHONPATH:-}}"
 _BUBBLE_OLD_PATH="$PATH"
-export PYTHONPATH="{shell_lib}${{PYTHONPATH:+:$PYTHONPATH}}"
+export PYTHONPATH="{shell_lib}{parent_libs}${{PYTHONPATH:+:$PYTHONPATH}}"
 export PATH="{shell_bin}:$PATH"
 export BUBBLE_SHELL="{name}"
 export BUBBLE_SHELL_DIR="{shell_dir}"
@@ -209,13 +209,18 @@ exec {python} "$@"
 """
 
 
-def _write_activate(shell_dir: Path, name: str) -> None:
+def _write_activate(shell_dir: Path, name: str,
+                    parent_lib_dirs: Optional[list[Path]] = None) -> None:
+    # Prepend each parent shell's lib/ so `source activate` inherits their
+    # packages on PYTHONPATH without needing a meta-finder.
+    parent_libs = "".join(f":{p}" for p in (parent_lib_dirs or []))
     activate = shell_dir / "activate"
     activate.write_text(_ACTIVATE_TMPL.format(
         shell_dir=str(shell_dir),
         shell_lib=str(shell_dir / "lib"),
         shell_bin=str(shell_dir / "bin"),
         name=name,
+        parent_libs=parent_libs,
     ))
     py_launcher = shell_dir / "python"
     py_launcher.write_text(_PYTHON_LAUNCHER_TMPL.format(python=sys.executable))
@@ -589,8 +594,107 @@ def _link_entry_points(shell_bin: Path, vault_path: Path, python: str) -> list[s
     return written
 
 
-def create(name: str, specs: list[str], *, exist_ok: bool = False) -> Path:
-    """Create a new shell with optional initial packages."""
+def _update_scope_in_metadata(conn: sqlite3.Connection,
+                               name: str, packages: dict) -> None:
+    """Write the current package pins into shells.metadata["scope"].
+
+    Called inside an open connection before commit so the scope is always
+    consistent with the manifest written in the same transaction.
+    packages: {pkg_name: {"version": v, "wheel_tag": t}}
+    """
+    row = conn.execute(
+        "SELECT metadata FROM shells WHERE name=?", (name,),
+    ).fetchone()
+    meta_blob = json.loads(row[0]) if row and row[0] else {}
+    meta_blob["scope"] = {
+        pkg: [info["version"], info["wheel_tag"]]
+        for pkg, info in packages.items()
+    }
+    conn.execute(
+        "UPDATE shells SET metadata=? WHERE name=?",
+        (json.dumps(meta_blob), name),
+    )
+
+
+def load_scope(name: str) -> Optional[dict[str, tuple[str, str]]]:
+    """Return the version-pinning scope stored in a shell's metadata, or None.
+
+    The scope maps package (distribution) name → (version, wheel_tag).
+    It is kept in sync with the shell manifest by every add/remove
+    operation so BUBBLE_SHELL-aware import resolution always reflects
+    the live shell state.
+    """
+    conn = db.connect()
+    try:
+        row = conn.execute(
+            "SELECT metadata FROM shells WHERE name=?", (name,),
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        scope_raw = json.loads(row[0]).get("scope")
+        if not scope_raw:
+            return None
+        return {k: (v[0], v[1]) for k, v in scope_raw.items()}
+    finally:
+        conn.close()
+
+
+def load_parent(name: str) -> Optional[str]:
+    """Return the parent shell name recorded in metadata, or None."""
+    conn = db.connect()
+    try:
+        row = conn.execute(
+            "SELECT metadata FROM shells WHERE name=?", (name,),
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        return json.loads(row[0]).get("parent")
+    finally:
+        conn.close()
+
+
+def set_parent(name: str, parent_name: str) -> None:
+    """Record a parent shell for scope inheritance and regenerate activate."""
+    conn = db.connect()
+    try:
+        row = conn.execute(
+            "SELECT metadata FROM shells WHERE name=?", (name,),
+        ).fetchone()
+        meta_blob = json.loads(row[0]) if row and row[0] else {}
+        meta_blob["parent"] = parent_name
+        conn.execute(
+            "UPDATE shells SET metadata=? WHERE name=?",
+            (json.dumps(meta_blob), name),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # Regenerate activate so parent libs appear on PYTHONPATH.
+    sd = shell_dir(name)
+    if sd.exists():
+        parent_libs = _collect_parent_libs(parent_name)
+        _write_activate(sd, name, parent_lib_dirs=parent_libs)
+
+
+def _collect_parent_libs(start_name: str) -> list[Path]:
+    """Walk the parent chain, return each shell's lib/ in order."""
+    libs: list[Path] = []
+    seen: set[str] = set()
+    current: Optional[str] = start_name
+    while current and current not in seen:
+        seen.add(current)
+        sd = shell_dir(current)
+        lib = sd / "lib"
+        if lib.is_dir():
+            libs.append(lib)
+        current = load_parent(current)
+    return libs
+
+
+def create(name: str, specs: list[str], *,
+           exist_ok: bool = False,
+           parent: Optional[str] = None) -> Path:
+    """Create a new shell with optional initial packages and optional parent."""
     sd = shell_dir(name)
     if sd.exists():
         if not exist_ok:
@@ -599,14 +703,18 @@ def create(name: str, specs: list[str], *, exist_ok: bool = False) -> Path:
         sd.mkdir(parents=True)
         (sd / "lib").mkdir()
         (sd / "bin").mkdir()
-    _write_activate(sd, name)
+    parent_libs = _collect_parent_libs(parent) if parent else []
+    _write_activate(sd, name, parent_lib_dirs=parent_libs)
     _write_manifest(sd, name, {})
+    initial_meta: dict = {}
+    if parent:
+        initial_meta["parent"] = parent
     conn = db.connect()
     conn.execute(
         "INSERT OR REPLACE INTO shells (name, created_at, last_used_at, "
         "shell_path, python_tag, lockfile, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)",
         (name, datetime.now().isoformat(), datetime.now().isoformat(),
-         str(sd), config.runner_python_tag(), None, json.dumps({})),
+         str(sd), config.runner_python_tag(), None, json.dumps(initial_meta)),
     )
     conn.commit()
     conn.close()
@@ -685,6 +793,7 @@ def add(name: str, specs: list[str]) -> dict:
             summary["scripts"].extend(scripts)
 
         _write_manifest(sd, name, pkgs)
+        _update_scope_in_metadata(conn, name, pkgs)
         conn.execute(
             "UPDATE shells SET last_used_at=? WHERE name=?",
             (datetime.now().isoformat(), name),
@@ -747,6 +856,7 @@ def add_pinned(name: str, pkg_name: str, version: str, wheel_tag: str) -> dict:
         summary["linked"].append((pkg_name, version, wheel_tag, len(linked)))
         summary["scripts"].extend(scripts)
         _write_manifest(sd, name, pkgs)
+        _update_scope_in_metadata(conn, name, pkgs)
         conn.execute(
             "UPDATE shells SET last_used_at=? WHERE name=?",
             (datetime.now().isoformat(), name),
@@ -783,6 +893,13 @@ def remove_packages(name: str, pkgs: list[str]) -> list[str]:
                     ep.unlink()
         removed.append(p)
     _write_manifest(sd, name, manifest)
+    if removed:
+        conn = db.connect()
+        try:
+            _update_scope_in_metadata(conn, name, manifest)
+            conn.commit()
+        finally:
+            conn.close()
     return removed
 
 

@@ -76,6 +76,11 @@ class VaultFinder(importlib.abc.MetaPathFinder):
         # Once an alias has been routed in this process we don't re-consult
         # host.toml on every submodule import.
         self._routed: dict[str, str] = {}
+        # Lazily-loaded shell scope (populated on first _lookup when
+        # BUBBLE_SHELL is set and no explicit scope was supplied at install).
+        # None = not yet loaded; {} = loaded but empty.
+        self._shell_scope: Optional[dict[str, tuple[str, str]]] = None
+        self._shell_scope_loaded: bool = False
 
     @staticmethod
     def _normalize_aliases(aliases: dict) -> dict[str, tuple[str, str, str, Optional[str]]]:
@@ -504,6 +509,50 @@ class VaultFinder(importlib.abc.MetaPathFinder):
                 return spec
         return None
 
+    # ──────────────── shell-aware scope resolution ───────────────
+
+    def _effective_scope(self) -> Optional[dict[str, tuple[str, str]]]:
+        """Return the scope to use for version pinning.
+
+        Priority:
+          1. Explicit scope passed to install() — manifest/lockfile path.
+          2. Shell scope loaded from BUBBLE_SHELL env var (project isolation).
+             Walks the parent chain so a spinoff project inherits its parent's
+             pins for packages it doesn't override itself.
+          3. None — fall through to best-version global resolution.
+        """
+        if self._scope is not None:
+            return self._scope
+        if not self._shell_scope_loaded:
+            self._shell_scope_loaded = True
+            self._shell_scope = self._load_shell_scope_chain()
+        return self._shell_scope
+
+    def _load_shell_scope_chain(self) -> Optional[dict[str, tuple[str, str]]]:
+        """Load scope from BUBBLE_SHELL and walk the parent chain.
+
+        Current shell's pins take precedence; parent fills in only for
+        import names not pinned by the child. Cycles are detected by the
+        seen-set.
+        """
+        shell_name = os.environ.get("BUBBLE_SHELL")
+        if not shell_name:
+            return None
+        from .run.shell import load_scope, load_parent
+        merged: dict[str, tuple[str, str]] = {}
+        seen: set[str] = set()
+        current: Optional[str] = shell_name
+        while current and current not in seen:
+            seen.add(current)
+            scope = load_scope(current)
+            if scope:
+                # Child wins: only fill keys not yet in merged.
+                for k, v in scope.items():
+                    if k not in merged:
+                        merged[k] = v
+            current = load_parent(current)
+        return merged if merged else None
+
     # ───────────────────── default path ─────────────────────
 
     def _lookup(self, name: str) -> Optional[Path]:
@@ -594,13 +643,14 @@ class VaultFinder(importlib.abc.MetaPathFinder):
         rows = [(n, v, t, str(store.vault_path_for(n, v, t))) for n, v, t in raw]
         if not rows:
             return None
-        if self._scope:
+        eff_scope = self._effective_scope()
+        if eff_scope:
             # Scope is a *pin* — for packages listed here, only allow the
             # specified (version, tag). For packages NOT listed, fall through
             # to default best-pick. This lets users pin what they care about
             # without enumerating every transitive dep.
             from .vault import metadata as _meta
-            scope_norm = {_meta.normalize_name(k): v for k, v in self._scope.items()}
+            scope_norm = {_meta.normalize_name(k): v for k, v in eff_scope.items()}
             pkg_norm_set = {_meta.normalize_name(r[0]) for r in rows}
             scoped_pkgs = pkg_norm_set & set(scope_norm)
             if scoped_pkgs:
