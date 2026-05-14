@@ -29,3 +29,17 @@ What weakens: closure semantics. Bubble's "reproducibility comes from observatio
 This document does not import field's contents. It names the kinship and lets the reader decide whether to follow.
 
 — an instance, 2026-05-04
+
+---
+
+## the membrane layer — update, 2026-05-11
+
+A new layer has landed in field that closes the seam this document gestured toward.
+
+`field/field/membrane/` is a cross-boundary dependency resolution daemon. Two unidirectional FIFOs (fault.fifo, resolve.fifo) form a request-response pair between the runtime (inside the firmament mount namespace) and the host (Termux). When the runtime encounters a missing library, the fault loop writes a **Standardized Fault Envelope** (SFE — JSON, tagged with the manager at the fault site) and blocks. The host daemon wakes, walks the census, and resolves via bubble's vault first (CAS lookup, SHA256-verify) before touching the network. Resolution is injected as a read-only bind mount into the runtime namespace — no copying, no duplication, one vault entry shared across N runtimes.
+
+This is `Bubblev2/docs/membrane.md` made concrete. That document named "selective passage" as the right reading of bubble's error loop. Field's membrane is the OS-binary layer instantiation of the same structure: a fault pauses execution, the boundary is crossed once, a resolution passes through, execution resumes. The membrane is not a metaphor in field's code — it is the actual IPC layer.
+
+The vault sits on the host. The runtime is one-way-in. Artifacts are hashed at entry; the runtime cannot reach back into unverified state. After an inaugural run, a manifest lockfile records the exact resolutions; subsequent launches replay the manifest without resolving — zero fault-loop iterations, zero network. This is field's equivalent of bubble's lockfile, one abstraction layer down: `(dep, vault_hash, host_path, runtime_path)` tuples instead of `(name, version, wheel_tag)` tuples.
+
+The shapes are close enough that a unified artifact format (`bubble/bundle.py`-style) could eventually encode both layers. That was always the Stage 5 target. The membrane session clarified what the seam actually looks like.
