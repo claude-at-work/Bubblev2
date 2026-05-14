@@ -14,9 +14,14 @@ The live codebase is the `bubble/` package. The original monolith is preserved i
 
 ```
 bubble/
-├── cli.py              # entry: vault | shell | run | up | probe | host
+├── cli.py              # entry: vault | shell | project | keep | run | up | probe | host
 │                       #   shell create --from manifest.toml
 │                       #   shell bundle / unbundle  (the deployment artifact)
+│                       #   keep capture / list / show / restore / remove
+├── keep.py             # path-addressed directory keeps: tar.gz + meta.toml
+│                       #   under ~/.bubble/keep/<name>/; .keepignore excludes;
+│                       #   size cap with --force-large; sha256 over tree
+│                       #   content and archive bytes
 ├── meta_finder.py      # VaultFinder on sys.meta_path; alias loaders;
 │                       #   verify-on-read + per-process integrity cache;
 │                       #   substrate routing dispatch via _spec_via_dlmopen
@@ -69,6 +74,7 @@ bubble/
 ~/.bubble/
 ├── vault/<name>/<version>/<wheel_tag>/<unpacked>
 ├── shells/<name>/{lib,bin,activate,manifest.toml}
+├── keep/<name>/{tree.tar.gz, meta.toml}   # path-addressed directory keeps
 ├── bubbles/<id>/                # ephemeral, dissolved after `up`
 ├── wheels/                      # transient downloads
 ├── vault.db                     # SQLite, schema v2
@@ -118,6 +124,13 @@ python3 -m bubble shell activate <name>          # prints sourceable path
 # deployment artifact
 python3 -m bubble shell bundle <name> -o <path.tar.gz>
 python3 -m bubble shell unbundle <path.tar.gz> [--allow-python-mismatch]
+
+# keep — path-addressed directory payloads
+python3 -m bubble keep capture <dir> --name NAME [--exclude PATTERN]... [--overwrite] [--force-large]
+python3 -m bubble keep list
+python3 -m bubble keep show <name>
+python3 -m bubble keep restore <name> [--target PATH] [--force]
+python3 -m bubble keep remove <name>
 
 # run a script
 python3 -m bubble run <script.py> [--isolate] [--scope versions.toml] [--lock out.lock] [args...]

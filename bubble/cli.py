@@ -318,6 +318,103 @@ def cmd_project_ingest(args: argparse.Namespace) -> int:
     return 0 if not summary.get("missing_imports") else 2
 
 
+def cmd_keep_capture(args: argparse.Namespace) -> int:
+    """bubble keep capture <dir> --name NAME
+
+    Capture an arbitrary directory tree into ~/.bubble/keep/<name>/ as
+    a gzipped tar with a meta.toml beside it. The vault now holds
+    path-addressed payloads alongside content-addressed Python packages.
+    """
+    from . import keep as keep_mod
+    config.ensure_dirs()
+    source = Path(args.dir).resolve()
+    if not source.is_dir():
+        print(f"error: not a directory: {source}", file=sys.stderr)
+        return 1
+    try:
+        meta = keep_mod.capture(
+            source,
+            args.name,
+            extra_excludes=args.exclude or [],
+            overwrite=bool(args.overwrite),
+            force_large=bool(args.force_large),
+        )
+    except (FileExistsError, NotADirectoryError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"kept '{meta['name']}'  ←  {meta['source']}")
+    print(f"  files:    {meta['files']}")
+    print(f"  source:   {meta['source_bytes'] / 1024:.1f} KiB")
+    print(f"  archive:  {meta['archive_bytes'] / 1024:.1f} KiB  "
+          f"({meta['archive_sha256'][:12]}…)")
+    if meta.get("excludes"):
+        print(f"  excludes: {', '.join(meta['excludes'])}")
+    print(f"  stored:   {config.KEEP_DIR / meta['name']}")
+    return 0
+
+
+def cmd_keep_list(args: argparse.Namespace) -> int:
+    """bubble keep list — inventory of captured trees."""
+    from . import keep as keep_mod
+    items = keep_mod.list_keeps()
+    if not items:
+        print("(no keeps)")
+        return 0
+    for m in items:
+        size_mb = m["archive_bytes"] / 1_048_576
+        print(f"  · {m['name']:<24}  {size_mb:>7.2f} MB  "
+              f"{m['captured_at']}  ←  {m['source']}")
+    return 0
+
+
+def cmd_keep_show(args: argparse.Namespace) -> int:
+    """bubble keep show <name> — show meta.toml contents for one keep."""
+    from . import keep as keep_mod
+    try:
+        m = keep_mod.show(args.name)
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    for k, v in m.items():
+        if isinstance(v, list):
+            v = ", ".join(str(x) for x in v) if v else "(none)"
+        print(f"  {k}: {v}")
+    return 0
+
+
+def cmd_keep_restore(args: argparse.Namespace) -> int:
+    """bubble keep restore <name> [--target PATH]
+
+    Re-extract a captured tree. Default target is the source path
+    recorded at capture time. Refuses to overwrite a non-empty target
+    unless --force.
+    """
+    from . import keep as keep_mod
+    target = Path(args.target).resolve() if args.target else None
+    try:
+        result = keep_mod.restore(args.name, target, force=bool(args.force))
+    except (FileNotFoundError, FileExistsError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"restored '{result['name']}' → {result['restored_to']}")
+    print(f"  files:        {result['files']}")
+    print(f"  captured at:  {result['captured_at']}")
+    return 0
+
+
+def cmd_keep_remove(args: argparse.Namespace) -> int:
+    """bubble keep remove <name> — delete a captured tree from the vault."""
+    from . import keep as keep_mod
+    try:
+        keep_mod.remove(args.name)
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"removed '{args.name}'")
+    return 0
+
+
 def cmd_shell_freeze(args: argparse.Namespace) -> int:
     """bubble shell freeze <name> -o <manifest> — snapshot shell as manifest."""
     from . import project as project_mod
@@ -1058,6 +1155,46 @@ def build_parser() -> argparse.ArgumentParser:
                     help="recreate the shell if it already exists")
     pi.add_argument("--verbose", "-v", action="store_true")
     pi.set_defaults(func=cmd_project_ingest)
+
+    # keep — path-addressed directory payloads in the vault
+    keep_p = sub.add_parser("keep",
+                            help="capture / restore arbitrary directory trees in the vault")
+    ksub = keep_p.add_subparsers(dest="keep_cmd", required=True)
+
+    kc = ksub.add_parser("capture",
+                         help="capture a directory tree into ~/.bubble/keep/<name>/")
+    kc.add_argument("dir", help="directory to capture")
+    kc.add_argument("--name", required=True,
+                    help="name under which to file this keep (no spaces)")
+    kc.add_argument("--exclude", action="append", default=[],
+                    metavar="PATTERN",
+                    help="extra substring pattern to exclude (repeatable); "
+                         "appends to defaults and any .keepignore at the source root")
+    kc.add_argument("--overwrite", action="store_true",
+                    help="replace an existing keep with this name")
+    kc.add_argument("--force-large", action="store_true",
+                    help="accept captures over the 100 MB compressed cap")
+    kc.set_defaults(func=cmd_keep_capture)
+
+    kl = ksub.add_parser("list", help="list keeps in the vault")
+    kl.set_defaults(func=cmd_keep_list)
+
+    ks = ksub.add_parser("show", help="show meta.toml for one keep")
+    ks.add_argument("name")
+    ks.set_defaults(func=cmd_keep_show)
+
+    kr = ksub.add_parser("restore",
+                         help="extract a kept tree back to disk")
+    kr.add_argument("name")
+    kr.add_argument("--target", default=None,
+                    help="where to extract (default: the source path recorded at capture)")
+    kr.add_argument("--force", action="store_true",
+                    help="overwrite a non-empty target directory")
+    kr.set_defaults(func=cmd_keep_restore)
+
+    krm = ksub.add_parser("remove", help="delete a keep from the vault")
+    krm.add_argument("name")
+    krm.set_defaults(func=cmd_keep_remove)
 
     # up — ephemeral per-script bubble (the original entry point)
     up = sub.add_parser("up", help="scan a script, assemble an ephemeral bubble, run")
