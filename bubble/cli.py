@@ -984,6 +984,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
 def cmd_default(args: argparse.Namespace) -> int:
     """No-args greeting. Show a tiny menu of where to start."""
     from . import __version__
+    from . import keep as keep_mod
     term.out()
     term.out(f"  {term.bold('◉ bubble')}  {term.dim('v' + __version__)}")
     if config.VAULT_DB.exists():
@@ -991,7 +992,11 @@ def cmd_default(args: argparse.Namespace) -> int:
             conn = db.connect()
             n_pkgs = conn.execute("SELECT COUNT(*) FROM packages").fetchone()[0]
             conn.close()
-            term.out(f"      {term.dim(f'{n_pkgs} packages vaulted')}")
+            n_keeps = len(keep_mod.list_keeps())
+            line = f"{n_pkgs} packages vaulted"
+            if n_keeps:
+                line += f", {n_keeps} keep{'s' if n_keeps != 1 else ''}"
+            term.out(f"      {term.dim(line)}")
         except Exception:
             pass
     else:
@@ -999,6 +1004,8 @@ def cmd_default(args: argparse.Namespace) -> int:
     term.out()
     term.out(f"  {term.cyan('bubble run <script.py>'):<48}  {term.dim('run a script')}")
     term.out(f"  {term.cyan('bubble vault get <pkg>'):<48}  {term.dim('pre-cache a package')}")
+    term.out(f"  {term.cyan('bubble project ingest <dir>'):<48}  {term.dim('ingest a project tree')}")
+    term.out(f"  {term.cyan('bubble keep capture <dir>'):<48}  {term.dim('archive a directory in the vault')}")
     term.out(f"  {term.cyan('bubble status'):<48}  {term.dim('what is in the vault')}")
     term.out(f"  {term.cyan('bubble doctor'):<48}  {term.dim('diagnose environment')}")
     term.out(f"  {term.cyan('bubble preflight <script.py>'):<48}  {term.dim('offline-readiness check')}")
@@ -1006,8 +1013,8 @@ def cmd_default(args: argparse.Namespace) -> int:
     term.out(f"  {term.cyan('bubble probe / host'):<48}  {term.dim('machine self-portrait')}")
     term.out()
     term.out(f"  {term.dim('flags:')}  "
-             f"{term.dim('-q quiet')}    "
-             f"{term.dim('-y auto-yes')}")
+             f"{term.dim('--quiet')}    "
+             f"{term.dim('--yes')}")
     term.out()
     return 0
 
