@@ -16,6 +16,7 @@ BUBBLES_DIR = BUBBLE_HOME / "bubbles"
 SHELLS_DIR = BUBBLE_HOME / "shells"
 LOGS_DIR = BUBBLE_HOME / "logs"
 WHEELS_DIR = BUBBLE_HOME / "wheels"
+KEEP_DIR = BUBBLE_HOME / "keep"
 STAGING_DIR = VAULT_DIR / ".staging"
 
 
@@ -27,7 +28,7 @@ def ensure_dirs() -> None:
     we leave it alone.
     """
     for d in (BUBBLE_HOME, VAULT_DIR, BUBBLES_DIR, SHELLS_DIR,
-              LOGS_DIR, WHEELS_DIR, STAGING_DIR):
+              LOGS_DIR, WHEELS_DIR, KEEP_DIR, STAGING_DIR):
         existed = d.exists()
         d.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not existed:
@@ -79,7 +80,7 @@ def set_home(home: Path | str) -> None:
     re-rooting the package after import.
     """
     global BUBBLE_HOME, VAULT_DIR, VAULT_DB, BUBBLES_DIR
-    global SHELLS_DIR, LOGS_DIR, WHEELS_DIR, STAGING_DIR
+    global SHELLS_DIR, LOGS_DIR, WHEELS_DIR, KEEP_DIR, STAGING_DIR
     new_home = Path(home).expanduser().resolve()
     BUBBLE_HOME = new_home
     VAULT_DIR = new_home / "vault"
@@ -88,5 +89,6 @@ def set_home(home: Path | str) -> None:
     SHELLS_DIR = new_home / "shells"
     LOGS_DIR = new_home / "logs"
     WHEELS_DIR = new_home / "wheels"
+    KEEP_DIR = new_home / "keep"
     STAGING_DIR = VAULT_DIR / ".staging"
     os.environ["BUBBLE_HOME"] = str(new_home)
