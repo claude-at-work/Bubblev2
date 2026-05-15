@@ -319,11 +319,11 @@ def cmd_project_ingest(args: argparse.Namespace) -> int:
 
 
 def cmd_keep_capture(args: argparse.Namespace) -> int:
-    """bubble keep capture <dir> --name NAME
+    """bubble keep capture <dir> [--name NAME]
 
-    Capture an arbitrary directory tree into ~/.bubble/keep/<name>/ as
-    a gzipped tar with a meta.toml beside it. The vault now holds
-    path-addressed payloads alongside content-addressed Python packages.
+    Absorb a directory tree into the vault. The vault holds the live
+    tree from now on; the original path becomes a symlink pointing into
+    the vault unless --no-symlink-back is passed.
     """
     from . import keep as keep_mod
     config.ensure_dirs()
@@ -335,76 +335,132 @@ def cmd_keep_capture(args: argparse.Namespace) -> int:
         meta = keep_mod.capture(
             source,
             args.name,
-            extra_excludes=args.exclude or [],
+            symlink_back=not args.no_symlink_back,
             overwrite=bool(args.overwrite),
-            force_large=bool(args.force_large),
         )
-    except (FileExistsError, NotADirectoryError, OSError) as exc:
+    except (FileExistsError, NotADirectoryError, ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    print(f"kept '{meta['name']}'  ←  {meta['source']}")
-    print(f"  files:    {meta['files']}")
-    print(f"  source:   {meta['source_bytes'] / 1024:.1f} KiB")
-    print(f"  archive:  {meta['archive_bytes'] / 1024:.1f} KiB  "
-          f"({meta['archive_sha256'][:12]}…)")
-    if meta.get("excludes"):
-        print(f"  excludes: {', '.join(meta['excludes'])}")
-    print(f"  stored:   {config.KEEP_DIR / meta['name']}")
+    dest = config.KEEP_DIR / meta["name"]
+    print(f"kept '{meta['name']}'  ←  {source}")
+    print(f"  vault:    {dest}")
+    if meta["symlinks"]:
+        for s in meta["symlinks"]:
+            arrow = dest if s["to"] == "." else dest / s["to"]
+            print(f"  symlink:  {s['from']}  →  {arrow}")
+    else:
+        print(f"  symlink:  (none — source left in place)")
     return 0
 
 
 def cmd_keep_list(args: argparse.Namespace) -> int:
-    """bubble keep list — inventory of captured trees."""
+    """bubble keep list — inventory of vaulted trees and file-sets."""
     from . import keep as keep_mod
     items = keep_mod.list_keeps()
     if not items:
         print("(no keeps)")
         return 0
     for m in items:
-        size_mb = m["archive_bytes"] / 1_048_576
-        print(f"  · {m['name']:<24}  {size_mb:>7.2f} MB  "
-              f"{m['captured_at']}  ←  {m['source']}")
+        size = m.get("_size_bytes", 0)
+        size_str = f"{size / 1024:.1f} KiB" if size < 1_048_576 \
+            else f"{size / 1_048_576:.2f} MB"
+        sources = ", ".join(s["from"] for s in m.get("symlinks", []))
+        if not sources:
+            sources = "(unwired)"
+        print(f"  · {m['name']:<24}  {m['kind']:<5}  {size_str:>9}  "
+              f"{m['captured_at']}  ←  {sources}")
     return 0
 
 
 def cmd_keep_show(args: argparse.Namespace) -> int:
-    """bubble keep show <name> — show meta.toml contents for one keep."""
+    """bubble keep show <name> — print meta for one keep."""
     from . import keep as keep_mod
     try:
         m = keep_mod.show(args.name)
     except FileNotFoundError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    for k, v in m.items():
-        if isinstance(v, list):
-            v = ", ".join(str(x) for x in v) if v else "(none)"
-        print(f"  {k}: {v}")
+    print(f"  name:        {m['name']}")
+    print(f"  kind:        {m['kind']}")
+    print(f"  captured:    {m['captured_at']}")
+    print(f"  vault path:  {config.KEEP_DIR / m['name']}")
+    size = m.get("_size_bytes", 0)
+    print(f"  size:        "
+          f"{size / 1024:.1f} KiB" if size < 1_048_576
+          else f"  size:        {size / 1_048_576:.2f} MB")
+    for s in m.get("symlinks", []):
+        print(f"  symlink:     {s['from']}  →  {s['to']}")
     return 0
 
 
-def cmd_keep_restore(args: argparse.Namespace) -> int:
-    """bubble keep restore <name> [--target PATH]
-
-    Re-extract a captured tree. Default target is the source path
-    recorded at capture time. Refuses to overwrite a non-empty target
-    unless --force.
-    """
+def cmd_keep_wire(args: argparse.Namespace) -> int:
+    """bubble keep wire <name> — recreate source-path symlinks from meta."""
     from . import keep as keep_mod
-    target = Path(args.target).resolve() if args.target else None
     try:
-        result = keep_mod.restore(args.name, target, force=bool(args.force))
+        result = keep_mod.wire(args.name)
     except (FileNotFoundError, FileExistsError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    print(f"restored '{result['name']}' → {result['restored_to']}")
-    print(f"  files:        {result['files']}")
-    print(f"  captured at:  {result['captured_at']}")
+    if not result["wired"]:
+        print(f"'{args.name}': nothing to wire (symlinks already in place)")
+        return 0
+    for s in result["wired"]:
+        print(f"  wired:  {s['from']}  →  {s['to']}")
+    return 0
+
+
+def cmd_keep_unwire(args: argparse.Namespace) -> int:
+    """bubble keep unwire <name> — remove source-path symlinks; leave vault."""
+    from . import keep as keep_mod
+    try:
+        result = keep_mod.unwire(args.name)
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not result["unwired"]:
+        print(f"'{args.name}': nothing to unwire")
+        return 0
+    for s in result["unwired"]:
+        print(f"  unwired:  {s}")
+    return 0
+
+
+def cmd_keep_activate(args: argparse.Namespace) -> int:
+    """bubble keep activate <name> — symlink bin/ executables into ~/.local/bin/."""
+    from . import keep as keep_mod
+    try:
+        result = keep_mod.activate(args.name)
+    except (FileNotFoundError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    for path in result["activated"]:
+        print(f"  on PATH:  {path}")
+    for s in result["skipped"]:
+        print(f"  skipped:  {s['path']}  ({s['reason']})")
+    if not result["activated"] and not result["skipped"]:
+        print(f"'{args.name}': no executables in bin/")
+    return 0
+
+
+def cmd_keep_deactivate(args: argparse.Namespace) -> int:
+    """bubble keep deactivate <name> — remove the ~/.local/bin/ symlinks."""
+    from . import keep as keep_mod
+    try:
+        result = keep_mod.deactivate(args.name)
+    except (FileNotFoundError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not result["deactivated"]:
+        print(f"'{args.name}': nothing to deactivate")
+        return 0
+    for path in result["deactivated"]:
+        print(f"  removed:  {path}")
     return 0
 
 
 def cmd_keep_remove(args: argparse.Namespace) -> int:
-    """bubble keep remove <name> — delete a captured tree from the vault."""
+    """bubble keep remove <name> — unwire, deactivate, delete from vault."""
     from . import keep as keep_mod
     try:
         keep_mod.remove(args.name)
@@ -645,20 +701,42 @@ def cmd_probe(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """bubble run <script.py> — demand-paged execution.
+    """bubble run <target> — dispatch on shape.
 
-    No pre-scan, no resolve, no assemble. The meta-path finder traps misses
-    and serves them from the vault. Network is opt-in: pass --fetch (or
-    set BUBBLE_AUTOFETCH=1) to allow vault misses to escalate to PyPI.
-    The strict default keeps every run sovereign — same script, same
-    bytes, no silent network.
+    `.py` script  → demand-paged Python execution through the meta-finder.
+    path to file  → exec it directly (sh/binary/etc), passing args through.
+    bare name     → resolve against vaulted keeps (looks at bin/<name>,
+                    then a single executable in bin/, then top-level
+                    <name>) and exec.
 
-    On a TTY (and unless --no-preflight is set or --fetch is already
-    granting network), a brief pre-flight scan surfaces missing deps
-    and offers to pre-cache them. Non-TTY contexts skip automatically.
+    Network is opt-in (Python path only): pass --fetch or set
+    BUBBLE_AUTOFETCH=1 to allow vault misses to escalate to PyPI.
     """
+    raw = args.script
+    raw_path = Path(raw)
+
+    # Non-Python dispatch: explicit file path or bare keep name.
+    if not raw.endswith(".py"):
+        target = None
+        if raw_path.exists():
+            target = raw_path.resolve()
+        else:
+            from . import keep as keep_mod
+            target = keep_mod.resolve_executable(raw)
+        if target is None:
+            term.err(f"  {term.red('✗')} cannot resolve '{raw}' as file or keep")
+            return 1
+        if not os.access(target, os.X_OK):
+            term.err(f"  {term.red('✗')} not executable: {target}")
+            return 1
+        # Hand the process to the target. argv[0] is the target path so
+        # the program sees its real name.
+        os.execv(str(target), [str(target), *(args.args or [])])
+        return 1  # unreachable; execv replaces the process
+
+    # Python path.
     db.init_db()
-    script = Path(args.script).resolve()
+    script = raw_path.resolve()
     if not script.exists():
         term.err(f"  {term.red('✗')} not found: {script}")
         return 1
@@ -940,6 +1018,21 @@ def cmd_status(args: argparse.Namespace) -> int:
              f"{size_bytes / (1024 * 1024):.1f} MB")
     term.out(f"      {n_mods:,} modules, {n_tl:,} import names indexed")
     term.out(f"      {n_shells} shell{'s' if n_shells != 1 else ''}")
+
+    from . import keep as keep_mod
+    keeps = keep_mod.list_keeps()
+    if keeps:
+        total_keep_bytes = sum(k.get("_size_bytes", 0) for k in keeps)
+        term.out()
+        term.out(f"  {term.bold('◉ keep')}  {term.dim('projects & config in the vault')}")
+        term.out(f"      {len(keeps)} keep{'s' if len(keeps) != 1 else ''}, "
+                 f"{total_keep_bytes / (1024 * 1024):.2f} MB")
+        for k in keeps:
+            sz = k.get("_size_bytes", 0)
+            sz_str = f"{sz / 1024:.1f} KiB" if sz < 1_048_576 \
+                else f"{sz / 1_048_576:.2f} MB"
+            term.out(f"      · {k['name']:<20}  {term.dim(k['kind']):<14}  "
+                     f"{term.dim(sz_str)}")
     term.out()
     return 0
 
@@ -1163,43 +1256,55 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--verbose", "-v", action="store_true")
     pi.set_defaults(func=cmd_project_ingest)
 
-    # keep — path-addressed directory payloads in the vault
+    # keep — vault as canonical home for projects, repos, and shell config
     keep_p = sub.add_parser("keep",
-                            help="capture / restore arbitrary directory trees in the vault")
+                            help="absorb directories and files into the vault "
+                                 "as the canonical home")
     ksub = keep_p.add_subparsers(dest="keep_cmd", required=True)
 
     kc = ksub.add_parser("capture",
-                         help="capture a directory tree into ~/.bubble/keep/<name>/")
-    kc.add_argument("dir", help="directory to capture")
-    kc.add_argument("--name", required=True,
-                    help="name under which to file this keep (no spaces)")
-    kc.add_argument("--exclude", action="append", default=[],
-                    metavar="PATTERN",
-                    help="extra substring pattern to exclude (repeatable); "
-                         "appends to defaults and any .keepignore at the source root")
+                         help="absorb a directory into the vault and symlink the "
+                              "original path to it")
+    kc.add_argument("dir", help="directory to absorb")
+    kc.add_argument("--name", default=None,
+                    help="name to file this keep under (default: basename of dir)")
     kc.add_argument("--overwrite", action="store_true",
                     help="replace an existing keep with this name")
-    kc.add_argument("--force-large", action="store_true",
-                    help="accept captures over the 100 MB compressed cap")
+    kc.add_argument("--no-symlink-back", action="store_true",
+                    help="leave the source path alone; do not replace it with a "
+                         "symlink (the vault still receives a copy)")
     kc.set_defaults(func=cmd_keep_capture)
 
     kl = ksub.add_parser("list", help="list keeps in the vault")
     kl.set_defaults(func=cmd_keep_list)
 
-    ks = ksub.add_parser("show", help="show meta.toml for one keep")
+    ks = ksub.add_parser("show", help="show meta for one keep")
     ks.add_argument("name")
     ks.set_defaults(func=cmd_keep_show)
 
-    kr = ksub.add_parser("restore",
-                         help="extract a kept tree back to disk")
-    kr.add_argument("name")
-    kr.add_argument("--target", default=None,
-                    help="where to extract (default: the source path recorded at capture)")
-    kr.add_argument("--force", action="store_true",
-                    help="overwrite a non-empty target directory")
-    kr.set_defaults(func=cmd_keep_restore)
+    kw = ksub.add_parser("wire",
+                         help="recreate the source-path symlinks recorded in meta "
+                              "(use after a filesystem nuke or unwire)")
+    kw.add_argument("name")
+    kw.set_defaults(func=cmd_keep_wire)
 
-    krm = ksub.add_parser("remove", help="delete a keep from the vault")
+    kuw = ksub.add_parser("unwire",
+                          help="remove the source-path symlinks; the vault tree stays")
+    kuw.add_argument("name")
+    kuw.set_defaults(func=cmd_keep_unwire)
+
+    ka = ksub.add_parser("activate",
+                         help="symlink the keep's bin/ executables into ~/.local/bin/")
+    ka.add_argument("name")
+    ka.set_defaults(func=cmd_keep_activate)
+
+    kda = ksub.add_parser("deactivate",
+                          help="remove the ~/.local/bin/ symlinks for this keep")
+    kda.add_argument("name")
+    kda.set_defaults(func=cmd_keep_deactivate)
+
+    krm = ksub.add_parser("remove",
+                          help="unwire, deactivate, and delete from the vault")
     krm.add_argument("name")
     krm.set_defaults(func=cmd_keep_remove)
 

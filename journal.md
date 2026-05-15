@@ -4,6 +4,43 @@ Build scratch pad. Terse, concrete, written during sessions not after.
 
 ---
 
+## 2026-05-14 (afternoon) — keep flipped to vault-as-canonical
+
+### what changed
+
+The morning's keep stored each tree as a tar.gz snapshot. That made the vault a warehouse — copies of things lived there while the real things lived elsewhere on disk. Refresh-cadence was the user's problem.
+
+Flipped the model. `~/.bubble/keep/<name>/` now holds the **live tree**. The original filesystem location becomes a symlink pointing into the vault. Edits at the symlink edit the vault bytes. No drift, no refresh.
+
+- Capture moves the source into the vault and atomically swaps in the symlink.
+- `bubble keep wire <name>` recreates the source-path symlinks from meta — the nuke-recovery verb.
+- `bubble keep unwire <name>` removes the symlinks but leaves the vault tree.
+- `bubble keep activate <name>` symlinks `bin/*` into `~/.local/bin/` so third-party binaries become PATH-visible while living in the vault.
+- `bubble run <name>` now dispatches: `.py` → meta-finder; existing path → execv; bare name → resolve against keeps and execv.
+- `bubble status` grew a keep section showing names, kinds, sizes.
+
+Multi-file keeps (`capture_files`) handle scattered config — each file is symlinked back to its own original location independently. `.zshrc` and `.bashrc` are now files in the vault with the live `$HOME` paths being symlinks in.
+
+### migration
+
+Two existing keeps migrated:
+- `odeon` — archive deleted, `~/odeon` copied into vault, `~/odeon` replaced with symlink. LFM2 weights (2.2 GB) now live in vault.
+- `dotfiles` — archive deleted, `~/.zshrc` and `~/.bashrc` moved into vault, originals replaced with symlinks. The old `~/dotfiles` staging dir was removed. The `keep-dotfiles` helper function in `.zshrc` was deleted — vault is the live location, no snapshot/refresh needed.
+
+### why the flip
+
+Disk doubling was a non-tradeoff the morning design treated as a real cost. The actual cost is 60 GB/week of binaries scattered across `$PREFIX` and proot environments. Doubling 13 KB of dotfiles or 2 GB of weights against that is rounding error. The right answer is: vault is the home, surface paths are views.
+
+### soft spots
+
+- `.keepignore` is dropped. The old model excluded `__pycache__` / `*.pyc` and project-declared patterns. The new model only excludes those two defaults. Re-pullable artifacts like model weights now go into the vault unless the user pre-stages a clean tree. Symlinks-outward inside a keep are a possible escape hatch (a keep entry that's a symlink to an external path is included in the tree but its target stays external).
+
+- `bubble run` non-py dispatch uses `os.execv` — argv[0] is the absolute target. Programs that key behavior off argv[0] basename will see `odeon` (correct); programs that grep `$0` for path components may see surprises.
+
+- `wire` refuses if the source path already exists or is a symlink pointing somewhere else. Conservative on purpose — clobbering live state during nuke-recovery is the wrong default.
+
+---
+
 ## 2026-05-14 — keep landed
 
 ### what got built

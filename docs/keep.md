@@ -1,37 +1,56 @@
 # keep
 
-The vault was content-addressed Python packages. Keep is the second region: arbitrary user-chosen directory trees, named, captured as a single archive, restorable on a fresh filesystem.
+The vault is content-addressed for Python packages — bubble decides what goes there based on what scripts import. Keep is the other region: arbitrary user-chosen trees and files, named by the user, made canonical by the vault.
 
-The two regions answer different questions. The package vault answers *what does this script import?* — its contents are derivable; a runtime put them there. Keep answers *what did I decide matters?* — its contents are not derivable from anything else, and nothing will put them back if they are lost.
+## the inversion
+
+The first draft of keep stored each tree as a tar.gz under `~/.bubble/keep/<name>/`. That made the vault a snapshot warehouse — a place where copies of things lived, while the *real* things lived elsewhere on disk. The user had to choose between editing the live copy and refreshing the snapshot.
+
+Keep flipped. The vault holds the live tree directly. The original filesystem location becomes a symlink pointing into the vault. Edits at the symlink edit the vault bytes — there is no second copy to refresh, no drift to chase.
 
 ## what gets captured
 
-A directory tree. The user names it. The capture writes one tar.gz under `~/.bubble/keep/<name>/tree.tar.gz` and a `meta.toml` next to it. That is the whole layout.
+A directory or a set of files. The user names the keep (or lets the basename of the source decide). Capture copies the tree into `~/.bubble/keep/<name>/`, writes provenance to `~/.bubble/keep/.meta/<name>.toml`, then atomically replaces the source path with a symlink to the vault copy.
 
-What is excluded by default: `__pycache__`, `*.pyc` — never useful to preserve. What else gets excluded comes from the project itself: a `.keepignore` file at the source root, gitignore-style but simple — one substring pattern per line, lines starting with `#` are comments, a path matches if any pattern is a substring of the path relative to the source root. The CLI `--exclude PATTERN` flag appends to whatever `.keepignore` declared.
+For multi-file captures — shell rc files, scattered config — each file is moved into the vault keep dir under its basename and symlinked back to its own original location independently. The meta records each `(source_path → vault_relative)` pair.
 
-The intent of `.keepignore` is for the project to declare its own non-essentials in version control next to its code. Weights re-pullable from a registry, runtime state, transcripts that grow forever — these don't belong in a capture meant to survive a filesystem nuke.
+A `--no-symlink-back` flag is available if the user wants the source left in place (the vault still receives a copy). The default is to symlink: the inversion is the whole point.
 
-## the size cap
+## wire and unwire
 
-Captures over 100 MB compressed refuse. The user passes `--force-large` to accept, or adds patterns to `.keepignore`. The point of keep is that the user picks what's important; silent inflation would defeat that. A capture that refuses is a capture that made the user look.
+Two verbs handle the symlink layer alone, separate from the bytes:
 
-## two integrity edges
+`bubble keep wire <name>` recreates the source-path symlinks from meta. This is the nuke-recovery verb — restore the vault directory from wherever it's backed up, then `wire` reconnects every captured tree to the place it was supposed to live.
 
-`tree_sha256` — hash over the included file contents and their relative paths, in deterministic walk order. Stable across machines as long as the exclude set is the same. This is the cryptographic edge between *what was on disk* and *what got captured*.
+`bubble keep unwire <name>` removes the source-path symlinks but leaves the vault tree intact. The vault is still the canonical home; the surface paths just stop pointing at it.
 
-`archive_sha256` — hash over the tar.gz bytes themselves. Re-checked at restore-time before any extraction. This is the cryptographic edge between *what got written* and *what is being read back*. A mismatch refuses the restore.
+## activate and deactivate
 
-## restore
+When a keep has a `bin/` directory, `bubble keep activate <name>` symlinks each executable in it into `~/.local/bin/`, making the binaries PATH-visible. Deactivate removes those symlinks; the bin tree stays in the vault.
 
-`bubble keep restore <name>` extracts back to the original source path recorded in `meta.toml`. `--target PATH` overrides. A non-empty target refuses unless `--force` is passed. Same posture as the size cap: a destructive restore is a thing the user has to mean.
+This is how third-party tools live in the vault rather than scattered across `$PREFIX`. The bytes are in `~/.bubble/keep/<name>/bin/`, the names are reachable through `~/.local/bin/`, and a filesystem nuke loses neither — restore the vault, run `activate`, the binaries are back.
 
-## what keep is not
+## bubble run
 
-Keep is not version control. It captures one tree at one moment. Two captures with the same name overwrite (with `--overwrite`); there is no history, no diff, no merge. The name space is flat. If the user wants history they have git; keep is the layer below that, for the trees git is not tracking — projects without commits, configuration, working directories whose .git is itself the thing being preserved.
+`bubble run <target>` dispatches on shape:
 
-Keep is not a backup system. It does not schedule, does not deduplicate across captures, does not sync to a remote. It writes a single tar.gz to the local vault home. What the user does with the vault home is the user's call — `bubble shell bundle` is a separate seam for portability, and a keep can ride along inside a shell bundle if the user wants it to.
+- A `.py` script gets the meta-finder loading from the vault (the original bubble run path).
+- A path that exists and is executable gets `execv`'d directly — sh, binary, whatever the kernel knows how to run.
+- A bare name is resolved against vaulted keeps — `bin/<name>`, a single executable in `bin/`, or a top-level file with that name — and `execv`'d if found.
+
+The dispatch means `bubble run odeon` is the same as typing the absolute path to the odeon binary, but driven by the keep registry.
+
+## meta
+
+Each keep's meta records:
+
+- `name` — what the user filed it under
+- `kind` — `dir` or `files`
+- `captured_at` — when capture ran
+- `symlinks` — list of `(source_path, vault_relative)` pairs for wire/unwire
+
+No archive hash. No tree hash. The live tree on disk *is* the truth. If you want a verified backup, that's what a backup tool is for — keep doesn't pretend to be one.
 
 ## posture
 
-Keep was added because the vault grew an asymmetry it shouldn't have had: bubble could tell you what your scripts touched, but not what *you* touched. A user who runs `bubble` for a year and then nukes the filesystem should not lose what they pointed at deliberately. The cost was small — one module, five verbs, a stdlib tar.gz codec — and the asymmetry it closes is the difference between a cache and an archive.
+Keep was added because the vault grew an asymmetry. Bubble could tell you what your scripts touched but not what *you* touched. The inversion goes further: the vault doesn't just track what you touched, it becomes the place those things live. A user who runs bubble for a year and then loses the filesystem doesn't lose the cache (which they could refetch) — they lose what they pointed at deliberately. Keep is the region that survives that.
