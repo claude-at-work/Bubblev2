@@ -1,324 +1,432 @@
-"""Keep — path-addressed directory payloads in the vault.
+"""Keep — directory and file payloads in the vault, vault as canonical home.
 
-The vault was content-addressed Python packages. Keep is the second region:
-arbitrary user-chosen directory trees, named, captured as tar.gz, restorable
-on a fresh filesystem. The intent is deliberate. The vault becomes what the
-user *decided* matters, not what a runtime happened to install.
+The vault is where deliberately-chosen artifacts live. Keep is the region
+for arbitrary user trees and standalone files — projects, third-party
+repos, shell rc files — that survive a filesystem nuke and stay the
+same bytes wherever they're referenced.
+
+Inversion
+---------
+The earlier draft of keep stored each tree as a tar.gz under
+`~/.bubble/keep/<name>/`. That made the vault a snapshot warehouse,
+not a home. The current model flips it: the vault holds the live tree,
+and the original filesystem location becomes a symlink pointing in.
+Edits at the symlink edit the vault bytes directly. Nothing to refresh,
+no drift to track.
 
 Layout
 ------
-~/.bubble/keep/<name>/
-    tree.tar.gz   the captured tree, gzip-compressed (stdlib only)
-    meta.toml     name, source path, captured_at, sha256, byte counts,
-                  excludes that were applied
+~/.bubble/keep/<name>/             live tree (or live files for multi-file keeps)
+~/.bubble/keep/.meta/<name>.toml   provenance: name, kind, captured_at,
+                                   plus a list of (source_path, vault_relative)
+                                   symlink pairs
 
-Excludes
+Symlinks
 --------
-Default excludes: __pycache__, *.pyc — never useful to preserve. Everything
-else is captured unless the project has a `.keepignore` file at its root.
-.keepignore is gitignore-style but simple: one substring pattern per line,
-lines starting with `#` are comments. A path matches if any pattern is a
-substring of the path *relative to the source root*. The CLI `--exclude
-PATTERN` flag appends to whatever .keepignore declared.
+Capture moves the source into the vault and replaces the original path
+with a symlink. For multi-file keeps (e.g. shell rc files), each file
+is symlinked back to its own original location independently.
 
-Size cap
+Wire / unwire are the nuke-recovery and reversal verbs: wire recreates
+the source-path symlinks from meta; unwire removes them but leaves the
+vault tree.
+
+Activate
 --------
-Captures over `SIZE_WARN_BYTES` (100 MB compressed) refuse unless
---force-large is set. The point of keep is that the user picks what's
-important; silent inflation defeats that.
+When a keep has a `bin/` directory, `activate` symlinks each executable
+into ~/.local/bin/ so the binaries become PATH-visible. Deactivate
+removes those symlinks; the live tree stays in the vault.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
-import gzip
-import hashlib
-import io
 import os
 import shutil
-import sys
-import tarfile
 from pathlib import Path
 
 from . import config
 
 
-KEEP_DIRNAME = "keep"
-TREE_FILENAME = "tree.tar.gz"
-META_FILENAME = "meta.toml"
-KEEPIGNORE = ".keepignore"
+META_DIRNAME = ".meta"
+BIN_SUBDIR = "bin"
 
-DEFAULT_EXCLUDES = ["__pycache__", ".pyc"]
-SIZE_WARN_BYTES = 100 * 1024 * 1024  # 100 MB compressed
+_DEFAULT_COPY_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc")
+
+
+# ─────────────────────── paths ────────────────────────
 
 
 def _keep_root() -> Path:
     return config.KEEP_DIR
 
 
+def _meta_root() -> Path:
+    return _keep_root() / META_DIRNAME
+
+
 def _keep_dir(name: str) -> Path:
     return _keep_root() / name
 
 
-def _read_keepignore(source: Path) -> list[str]:
-    f = source / KEEPIGNORE
-    if not f.exists():
-        return []
-    out = []
-    for line in f.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        out.append(line)
-    return out
+def _meta_path(name: str) -> Path:
+    return _meta_root() / f"{name}.toml"
 
 
-def _excluded(rel_path: str, patterns: list[str]) -> bool:
-    for p in patterns:
-        if p in rel_path:
-            return True
-    return False
+def _user_local_bin() -> Path:
+    return Path.home() / ".local" / "bin"
 
 
-def _walk_files(source: Path, excludes: list[str]):
-    """Yield (absolute_path, relative_path_str) for every file to include.
-    Deterministic order: sorted by relative path. Skips symlinks pointing
-    outside the source tree."""
-    source = source.resolve()
-    pairs = []
-    for root, dirs, files in os.walk(source):
-        root_p = Path(root)
-        # Filter directories in-place so os.walk skips excluded subtrees.
-        dirs[:] = sorted(
-            d for d in dirs
-            if not _excluded(str((root_p / d).relative_to(source)) + "/", excludes)
-        )
-        for fname in sorted(files):
-            abs_p = root_p / fname
-            rel = str(abs_p.relative_to(source))
-            if _excluded(rel, excludes):
-                continue
-            pairs.append((abs_p, rel))
-    pairs.sort(key=lambda pr: pr[1])
-    for pr in pairs:
-        yield pr
+def _validate_name(name: str) -> None:
+    if not name or "/" in name or name in (".", "..") or name.startswith("."):
+        raise ValueError(f"invalid keep name: {name!r}")
 
 
-def _tree_sha(source: Path, excludes: list[str]) -> str:
-    """Hash content + relative paths of all included files. Stable across
-    machines as long as exclude set is the same."""
-    h = hashlib.sha256()
-    for abs_p, rel in _walk_files(source, excludes):
-        h.update(rel.encode("utf-8"))
-        h.update(b"\0")
-        try:
-            with open(abs_p, "rb") as f:
-                while True:
-                    chunk = f.read(1 << 20)
-                    if not chunk:
-                        break
-                    h.update(chunk)
-        except OSError:
-            continue
-        h.update(b"\0")
-    return h.hexdigest()
-
-
-# ─────────────────────── capture ────────────────────────
+# ─────────────────────── capture (directory) ────────────────────────
 
 
 def capture(
     source: Path,
-    name: str,
+    name: str | None = None,
     *,
-    extra_excludes: list[str] | None = None,
+    symlink_back: bool = True,
     overwrite: bool = False,
-    force_large: bool = False,
 ) -> dict:
-    """Capture *source* into ~/.bubble/keep/<name>/. Returns a summary dict."""
+    """Absorb *source* directory into the vault. Replaces the original
+    path with a symlink pointing into the vault unless symlink_back=False.
+    """
     source = Path(source).resolve()
     if not source.is_dir():
         raise NotADirectoryError(f"not a directory: {source}")
+    if name is None:
+        name = source.name
+    _validate_name(name)
 
-    excludes = list(DEFAULT_EXCLUDES)
-    excludes += _read_keepignore(source)
-    if extra_excludes:
-        excludes += list(extra_excludes)
+    keep_root = _keep_root().resolve()
+    try:
+        source.relative_to(keep_root)
+        raise ValueError(f"refuse: {source} is already inside the vault keep area")
+    except ValueError as exc:
+        if "already inside" in str(exc):
+            raise
 
-    dest_dir = _keep_dir(name)
-    if dest_dir.exists():
+    dest = _keep_dir(name)
+    if dest.exists() or dest.is_symlink():
         if not overwrite:
             raise FileExistsError(
-                f"keep '{name}' already exists at {dest_dir} — pass --overwrite to replace"
+                f"keep '{name}' exists at {dest} — pass --overwrite to replace"
             )
-        shutil.rmtree(dest_dir)
-    dest_dir.mkdir(parents=True)
+        if dest.is_symlink():
+            dest.unlink()
+        else:
+            shutil.rmtree(dest)
 
-    tree_path = dest_dir / TREE_FILENAME
-    meta_path = dest_dir / META_FILENAME
+    _meta_root().mkdir(parents=True, exist_ok=True)
 
-    files_added = 0
-    source_bytes = 0
+    # Copy first so a mid-capture failure never leaves a hole at source.
+    shutil.copytree(source, dest, symlinks=True, ignore=_DEFAULT_COPY_IGNORE)
 
-    # Build tar.gz in a single pass.
-    with gzip.open(tree_path, "wb", compresslevel=6) as gz:
-        with tarfile.open(fileobj=gz, mode="w") as tar:
-            for abs_p, rel in _walk_files(source, excludes):
-                try:
-                    arcname = f"{name}/{rel}"
-                    tar.add(abs_p, arcname=arcname, recursive=False)
-                    files_added += 1
-                    source_bytes += abs_p.stat().st_size
-                except OSError as exc:
-                    print(f"  skip {rel}: {exc}", file=sys.stderr)
-
-    archive_bytes = tree_path.stat().st_size
-    if archive_bytes > SIZE_WARN_BYTES and not force_large:
-        # Roll back the capture so a refused keep doesn't leave a half-keep.
-        shutil.rmtree(dest_dir)
-        raise OSError(
-            f"keep '{name}' would be {archive_bytes / 1_048_576:.1f} MB compressed "
-            f"(cap is {SIZE_WARN_BYTES / 1_048_576:.0f} MB) — pass --force-large "
-            f"to accept, or add patterns to {source / KEEPIGNORE}"
-        )
-
-    # Hash the archive bytes themselves (for integrity verification on restore).
-    h = hashlib.sha256()
-    with open(tree_path, "rb") as f:
-        while True:
-            chunk = f.read(1 << 20)
-            if not chunk:
-                break
-            h.update(chunk)
-    archive_sha = h.hexdigest()
-
-    tree_sha = _tree_sha(source, excludes)
+    if symlink_back:
+        _swap_to_symlink(source, dest)
 
     meta = {
         "name": name,
-        "source": str(source),
+        "kind": "dir",
         "captured_at": _dt.datetime.now().isoformat(timespec="seconds"),
-        "files": files_added,
-        "source_bytes": source_bytes,
-        "archive_bytes": archive_bytes,
-        "archive_sha256": archive_sha,
-        "tree_sha256": tree_sha,
-        "excludes": excludes,
+        "symlinks": [{"from": str(source), "to": "."}] if symlink_back else [],
     }
-    _write_meta(meta_path, meta)
-
+    _write_meta(_meta_path(name), meta)
     return meta
 
 
-def _write_meta(path: Path, meta: dict) -> None:
-    lines = []
-    for key in ("name", "source", "captured_at", "files", "source_bytes",
-                "archive_bytes", "archive_sha256", "tree_sha256"):
-        v = meta[key]
-        if isinstance(v, int):
-            lines.append(f"{key} = {v}")
+def capture_files(
+    files: list[Path],
+    name: str,
+    *,
+    symlink_back: bool = True,
+    overwrite: bool = False,
+) -> dict:
+    """Absorb a set of individual files into a single named keep. Each
+    file is moved into the vault keep dir under its basename, then (if
+    symlink_back) replaced at its original location with a symlink.
+    """
+    _validate_name(name)
+    files = [Path(f).resolve() for f in files]
+    for f in files:
+        if not f.is_file() and not f.is_symlink():
+            raise FileNotFoundError(f"not a file: {f}")
+    if len({f.name for f in files}) != len(files):
+        raise ValueError("file basenames must be unique within a keep")
+
+    dest = _keep_dir(name)
+    if dest.exists() or dest.is_symlink():
+        if not overwrite:
+            raise FileExistsError(
+                f"keep '{name}' exists at {dest} — pass --overwrite to replace"
+            )
+        if dest.is_symlink():
+            dest.unlink()
         else:
-            s = str(v).replace("\\", "\\\\").replace('"', '\\"')
-            lines.append(f'{key} = "{s}"')
-    exc = meta.get("excludes", [])
-    if exc:
-        items = ", ".join(f'"{e}"' for e in exc)
-        lines.append(f"excludes = [{items}]")
-    else:
-        lines.append("excludes = []")
-    path.write_text("\n".join(lines) + "\n")
+            shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    _meta_root().mkdir(parents=True, exist_ok=True)
 
+    symlinks = []
+    for src in files:
+        target = dest / src.name
+        shutil.copy2(src, target, follow_symlinks=True)
+        symlinks.append({"from": str(src), "to": src.name})
 
-def _read_meta(path: Path) -> dict:
-    import tomllib
-    with open(path, "rb") as f:
-        return tomllib.load(f)
+    if symlink_back:
+        for src in files:
+            target = dest / src.name
+            _swap_to_symlink(src, target)
 
-
-# ─────────────────────── restore ────────────────────────
-
-
-def restore(name: str, target: Path | None = None, *, force: bool = False) -> dict:
-    """Restore keep <name> into *target* (defaults to source from meta)."""
-    dest_dir = _keep_dir(name)
-    if not dest_dir.exists():
-        raise FileNotFoundError(f"no keep named '{name}' at {dest_dir}")
-
-    meta = _read_meta(dest_dir / META_FILENAME)
-    tree_path = dest_dir / TREE_FILENAME
-
-    # Verify archive bytes against recorded sha256.
-    h = hashlib.sha256()
-    with open(tree_path, "rb") as f:
-        while True:
-            chunk = f.read(1 << 20)
-            if not chunk:
-                break
-            h.update(chunk)
-    if h.hexdigest() != meta["archive_sha256"]:
-        raise OSError(
-            f"keep '{name}' archive sha256 mismatch — refusing restore. "
-            f"Inspect {tree_path}"
-        )
-
-    if target is None:
-        target = Path(meta["source"])
-    target = Path(target).resolve()
-
-    if target.exists() and any(target.iterdir()) and not force:
-        raise FileExistsError(
-            f"target {target} exists and is non-empty — pass --force to overwrite"
-        )
-    target.mkdir(parents=True, exist_ok=True)
-
-    # Extract: archive members are prefixed with `<name>/`; strip that.
-    with gzip.open(tree_path, "rb") as gz:
-        with tarfile.open(fileobj=gz, mode="r") as tar:
-            for member in tar.getmembers():
-                if not member.name.startswith(f"{name}/"):
-                    continue
-                stripped = member.name[len(name) + 1:]
-                if not stripped:
-                    continue
-                member.name = stripped
-                tar.extract(member, target, set_attrs=False)
-
-    return {
+    meta = {
         "name": name,
-        "restored_to": str(target),
-        "files": meta["files"],
-        "captured_at": meta["captured_at"],
+        "kind": "files",
+        "captured_at": _dt.datetime.now().isoformat(timespec="seconds"),
+        "symlinks": symlinks if symlink_back else [],
     }
+    _write_meta(_meta_path(name), meta)
+    return meta
+
+
+def _swap_to_symlink(source: Path, target: Path) -> None:
+    """Atomically replace `source` with a symlink to `target`. Renames
+    source aside first so a failed symlink call can roll back."""
+    swap = source.parent / (source.name + ".swap-keep")
+    if swap.exists() or swap.is_symlink():
+        if swap.is_dir() and not swap.is_symlink():
+            shutil.rmtree(swap)
+        else:
+            swap.unlink()
+    os.rename(str(source), str(swap))
+    try:
+        os.symlink(str(target), str(source))
+    except OSError:
+        os.rename(str(swap), str(source))
+        raise
+    if swap.is_dir() and not swap.is_symlink():
+        shutil.rmtree(swap)
+    else:
+        swap.unlink()
+
+
+# ─────────────────────── wire / unwire ────────────────────────
+
+
+def wire(name: str) -> dict:
+    """Recreate the source-path symlinks recorded in meta. For nuke recovery."""
+    meta = _read_meta(name)
+    dest = _keep_dir(name)
+    if not dest.exists():
+        raise FileNotFoundError(f"keep tree missing: {dest}")
+    wired = []
+    for entry in meta.get("symlinks", []):
+        src = Path(entry["from"])
+        target = dest if entry["to"] == "." else dest / entry["to"]
+        if src.is_symlink():
+            if Path(os.readlink(src)) == target:
+                continue
+            raise FileExistsError(
+                f"refuse: {src} is a symlink to {os.readlink(src)} — "
+                f"remove or rename first"
+            )
+        if src.exists():
+            raise FileExistsError(f"refuse: {src} exists — remove or rename first")
+        src.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(str(target), str(src))
+        wired.append({"from": str(src), "to": str(target)})
+    return {"name": name, "wired": wired}
+
+
+def unwire(name: str) -> dict:
+    """Remove the source-path symlinks (leave vault contents intact)."""
+    meta = _read_meta(name)
+    removed = []
+    for entry in meta.get("symlinks", []):
+        src = Path(entry["from"])
+        if src.is_symlink():
+            src.unlink()
+            removed.append(str(src))
+    return {"name": name, "unwired": removed}
+
+
+# ─────────────────────── activate (bin/ → ~/.local/bin) ────────────────────────
+
+
+def _bin_dir(name: str) -> Path:
+    return _keep_dir(name) / BIN_SUBDIR
+
+
+def activate(name: str) -> dict:
+    """Symlink each executable in keep/<name>/bin/ into ~/.local/bin/."""
+    bd = _bin_dir(name)
+    if not bd.is_dir():
+        raise FileNotFoundError(f"keep '{name}' has no bin/ directory at {bd}")
+    local_bin = _user_local_bin()
+    local_bin.mkdir(parents=True, exist_ok=True)
+    activated = []
+    skipped = []
+    for entry in sorted(bd.iterdir()):
+        if entry.is_dir():
+            continue
+        target_resolved = entry.resolve()
+        link = local_bin / entry.name
+        if link.is_symlink():
+            if Path(os.readlink(link)).resolve() == target_resolved:
+                activated.append(str(link))
+                continue
+            skipped.append({"path": str(link),
+                            "reason": f"existing symlink → {os.readlink(link)}"})
+            continue
+        if link.exists():
+            skipped.append({"path": str(link), "reason": "non-symlink file exists"})
+            continue
+        os.symlink(str(target_resolved), str(link))
+        activated.append(str(link))
+    return {"name": name, "activated": activated, "skipped": skipped}
+
+
+def deactivate(name: str) -> dict:
+    """Remove ~/.local/bin/* symlinks that point into this keep's bin/."""
+    bd = _bin_dir(name)
+    if not bd.is_dir():
+        return {"name": name, "deactivated": []}
+    local_bin = _user_local_bin()
+    removed = []
+    for entry in bd.iterdir():
+        link = local_bin / entry.name
+        if not link.is_symlink():
+            continue
+        try:
+            if Path(os.readlink(link)).resolve() == entry.resolve():
+                link.unlink()
+                removed.append(str(link))
+        except OSError:
+            continue
+    return {"name": name, "deactivated": removed}
 
 
 # ─────────────────────── inventory ────────────────────────
 
 
 def list_keeps() -> list[dict]:
-    root = _keep_root()
+    root = _meta_root()
     if not root.exists():
         return []
     out = []
-    for d in sorted(root.iterdir()):
-        meta_path = d / META_FILENAME
-        if not meta_path.exists():
+    for f in sorted(root.iterdir()):
+        if f.suffix != ".toml":
             continue
         try:
-            out.append(_read_meta(meta_path))
+            m = _load_meta_file(f)
+            m["_size_bytes"] = _tree_size(_keep_dir(m["name"]))
+            out.append(m)
         except Exception:
             continue
     return out
 
 
 def show(name: str) -> dict:
-    meta_path = _keep_dir(name) / META_FILENAME
-    if not meta_path.exists():
-        raise FileNotFoundError(f"no keep named '{name}'")
-    return _read_meta(meta_path)
+    m = _read_meta(name)
+    m["_size_bytes"] = _tree_size(_keep_dir(name))
+    return m
 
 
-def remove(name: str) -> None:
-    d = _keep_dir(name)
-    if not d.exists():
+def remove(name: str, *, unwire_first: bool = True) -> None:
+    dest = _keep_dir(name)
+    mpath = _meta_path(name)
+    if not dest.exists() and not mpath.exists():
         raise FileNotFoundError(f"no keep named '{name}'")
-    shutil.rmtree(d)
+    if unwire_first and mpath.exists():
+        try:
+            unwire(name)
+        except (FileNotFoundError, FileExistsError):
+            pass
+        try:
+            deactivate(name)
+        except (FileNotFoundError, OSError):
+            pass
+    if dest.exists() or dest.is_symlink():
+        if dest.is_symlink():
+            dest.unlink()
+        else:
+            shutil.rmtree(dest)
+    if mpath.exists():
+        mpath.unlink()
+
+
+# ─────────────────────── resolve for `bubble run` ────────────────────────
+
+
+def resolve_executable(name: str) -> Path | None:
+    """Find an executable for `bubble run <name>`. Looks at bin/<name>
+    first, then a single executable in bin/, then a top-level file with
+    that name."""
+    keep = _keep_dir(name)
+    if not keep.exists():
+        return None
+    bd = keep / BIN_SUBDIR
+    if bd.is_dir():
+        named = bd / name
+        if named.is_file() and os.access(named, os.X_OK):
+            return named.resolve()
+        execs = [p for p in bd.iterdir()
+                 if p.is_file() and os.access(p, os.X_OK)]
+        if len(execs) == 1:
+            return execs[0].resolve()
+    top = keep / name
+    if top.is_file() and os.access(top, os.X_OK):
+        return top.resolve()
+    return None
+
+
+# ─────────────────────── meta i/o ────────────────────────
+
+
+def _tree_size(p: Path) -> int:
+    if not p.exists():
+        return 0
+    total = 0
+    for f in p.rglob("*"):
+        try:
+            if f.is_file() and not f.is_symlink():
+                total += f.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _write_meta(path: Path, meta: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f'name = "{_escape(meta["name"])}"',
+        f'kind = "{_escape(meta["kind"])}"',
+        f'captured_at = "{_escape(meta["captured_at"])}"',
+        "",
+    ]
+    for s in meta.get("symlinks", []):
+        lines.append("[[symlinks]]")
+        lines.append(f'from = "{_escape(s["from"])}"')
+        lines.append(f'to = "{_escape(s["to"])}"')
+        lines.append("")
+    path.write_text("\n".join(lines))
+
+
+def _escape(s: str) -> str:
+    return str(s).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _read_meta(name: str) -> dict:
+    p = _meta_path(name)
+    if not p.exists():
+        raise FileNotFoundError(f"no keep named '{name}'")
+    return _load_meta_file(p)
+
+
+def _load_meta_file(p: Path) -> dict:
+    import tomllib
+    with open(p, "rb") as f:
+        return tomllib.load(f)

@@ -18,10 +18,11 @@ bubble/
 │                       #   shell create --from manifest.toml
 │                       #   shell bundle / unbundle  (the deployment artifact)
 │                       #   keep capture / list / show / restore / remove
-├── keep.py             # path-addressed directory keeps: tar.gz + meta.toml
-│                       #   under ~/.bubble/keep/<name>/; .keepignore excludes;
-│                       #   size cap with --force-large; sha256 over tree
-│                       #   content and archive bytes
+├── keep.py             # vault-as-canonical: ~/.bubble/keep/<name>/ holds the
+│                       #   live tree, original path becomes a symlink in;
+│                       #   capture / wire / unwire / activate / deactivate;
+│                       #   meta in ~/.bubble/keep/.meta/<name>.toml records
+│                       #   the (source_path, vault_relative) symlink pairs
 ├── meta_finder.py      # VaultFinder on sys.meta_path; alias loaders;
 │                       #   verify-on-read + per-process integrity cache;
 │                       #   substrate routing dispatch via _spec_via_dlmopen
@@ -74,7 +75,8 @@ bubble/
 ~/.bubble/
 ├── vault/<name>/<version>/<wheel_tag>/<unpacked>
 ├── shells/<name>/{lib,bin,activate,manifest.toml}
-├── keep/<name>/{tree.tar.gz, meta.toml}   # path-addressed directory keeps
+├── keep/<name>/                # live tree or files (vault-as-canonical)
+├── keep/.meta/<name>.toml      # provenance + symlink declarations
 ├── bubbles/<id>/                # ephemeral, dissolved after `up`
 ├── wheels/                      # transient downloads
 ├── vault.db                     # SQLite, schema v2
@@ -125,11 +127,14 @@ python3 -m bubble shell activate <name>          # prints sourceable path
 python3 -m bubble shell bundle <name> -o <path.tar.gz>
 python3 -m bubble shell unbundle <path.tar.gz> [--allow-python-mismatch]
 
-# keep — path-addressed directory payloads
-python3 -m bubble keep capture <dir> --name NAME [--exclude PATTERN]... [--overwrite] [--force-large]
+# keep — vault as canonical home for projects and config
+python3 -m bubble keep capture <dir> [--name NAME] [--overwrite] [--no-symlink-back]
 python3 -m bubble keep list
 python3 -m bubble keep show <name>
-python3 -m bubble keep restore <name> [--target PATH] [--force]
+python3 -m bubble keep wire <name>         # recreate source-path symlinks (nuke recovery)
+python3 -m bubble keep unwire <name>       # remove symlinks; vault tree stays
+python3 -m bubble keep activate <name>     # bin/ → ~/.local/bin/
+python3 -m bubble keep deactivate <name>
 python3 -m bubble keep remove <name>
 
 # run a script
