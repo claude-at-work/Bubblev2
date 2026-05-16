@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# tm — friendly tmux wrapper for mobile
+#
+# Install:
+#   cp tools/tm ~/bin/tm && chmod +x ~/bin/tm
+#   (make sure ~/bin is in $PATH)
+#
+# Usage:
+#   tm               smart default: attach if one session, menu otherwise
+#   tm new [NAME]    new session (default name: main)
+#   tm ls            list sessions
+#   tm kill NAME     kill a session by name
+#   tm NAME          attach or switch to named session directly
+
+set -euo pipefail
+
+# ── Utilities ─────────────────────────────────────────────────────────────
+
+_sessions() {
+    tmux list-sessions -F '#S' 2>/dev/null || true
+}
+
+_in_tmux() {
+    [ -n "${TMUX:-}" ]
+}
+
+_die() {
+    printf 'tm: %s\n' "$*" >&2
+    exit 1
+}
+
+_require_tmux() {
+    command -v tmux &>/dev/null || _die "tmux is not installed"
+}
+
+_hr() {
+    printf '─%.0s' $(seq 1 36); echo
+}
+
+# Print session list; mark current session with ←
+_print_sessions() {
+    local current=""
+    _in_tmux && current=$(tmux display-message -p '#S' 2>/dev/null || true)
+    local sessions
+    sessions=$(_sessions)
+    if [ -z "$sessions" ]; then
+        echo "  (no sessions)"
+        return
+    fi
+    local i=1
+    while IFS= read -r s; do
+        if [ "$s" = "$current" ]; then
+            printf '  %d) %s  ←\n' "$i" "$s"
+        else
+            printf '  %d) %s\n' "$i" "$s"
+        fi
+        i=$((i + 1))
+    done <<< "$sessions"
+}
+
+# Prompt user to pick a session by number; echoes the chosen session name
+_pick_session() {
+    local prompt="${1:-Session}"
+    local sessions
+    sessions=$(_sessions)
+    if [ -z "$sessions" ]; then
+        echo "  (no sessions)" >&2
+        return 1
+    fi
+    local i=1
+    while IFS= read -r s; do
+        printf '  %d) %s\n' "$i" "$s" >&2
+        i=$((i + 1))
+    done <<< "$sessions"
+    printf '%s: ' "$prompt" >&2
+    local n
+    read -r n
+    echo "$sessions" | sed -n "${n}p"
+}
+
+_pick_window() {
+    local prompt="${1:-Window}"
+    local wins
+    wins=$(tmux list-windows -F '#I: #W' 2>/dev/null) || { echo "  (no windows)" >&2; return 1; }
+    echo "$wins" | while IFS= read -r w; do
+        printf '  %s\n' "$w"
+    done >&2
+    printf '%s #: ' "$prompt" >&2
+    local n
+    read -r n
+    # validate numeric
+    case "$n" in
+        ''|*[!0-9]*) echo "" ;;
+        *) echo "$n" ;;
+    esac
+}
+
+# ── Quick sub-commands ────────────────────────────────────────────────────
+
+case "${1:-}" in
+    new|n)
+        _require_tmux
+        name="${2:-main}"
+        if tmux has-session -t "$name" 2>/dev/null; then
+            if _in_tmux; then
+                tmux switch-client -t "$name"
+            else
+                exec tmux attach -t "$name"
+            fi
+        else
+            if _in_tmux; then
+                tmux new-session -d -s "$name"
+                tmux switch-client -t "$name"
+            else
+                exec tmux new-session -s "$name"
+            fi
+        fi
+        exit
+        ;;
+    ls|list|l)
+        _require_tmux
+        _sessions || echo "(no sessions)"
+        exit
+        ;;
+    kill|k)
+        _require_tmux
+        [ -z "${2:-}" ] && _die "usage: tm kill <name>"
+        tmux kill-session -t "$2" && printf 'Killed: %s\n' "$2"
+        exit
+        ;;
+    help|-h|--help)
+        sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+        exit
+        ;;
+    "")
+        # fall through to smart default
+        ;;
+    *)
+        # treat bare argument as session name to attach/switch
+        _require_tmux
+        name="$1"
+        if _in_tmux; then
+            tmux switch-client -t "$name" 2>/dev/null || _die "no session '$name'"
+        else
+            exec tmux attach -t "$name" 2>/dev/null || _die "no session '$name'"
+        fi
+        exit
+        ;;
+esac
+
+_require_tmux
+
+# ── Smart default (no args) ───────────────────────────────────────────────
+
+if ! _in_tmux; then
+    sessions=$(_sessions)
+    if [ -z "$sessions" ]; then
+        # Nothing running — start a new session immediately
+        exec tmux new-session -s main
+    fi
+    count=$(printf '%s\n' "$sessions" | wc -l)
+    if [ "$count" -eq 1 ]; then
+        # Exactly one session — attach straight away
+        exec tmux attach -t "$(printf '%s\n' "$sessions" | head -1)"
+    fi
+    # Multiple sessions — fall through to the menu
+fi
+
+# ── Interactive menu ──────────────────────────────────────────────────────
+
+_menu_inside_tmux() {
+    while true; do
+        clear
+        _hr
+        printf '  tm\n'
+        _hr
+        _print_sessions
+        echo ""
+        printf '  Sessions\n'
+        printf '    1) new    2) switch    3) rename    4) kill\n'
+        echo ""
+        printf '  Windows\n'
+        printf '    5) new    6) switch    7) rename    8) kill\n'
+        echo ""
+        printf '  Panes\n'
+        printf '    9) split right    0) split down    p) kill pane\n'
+        echo ""
+        printf '  q) quit\n'
+        echo ""
+        printf '> '
+        read -r choice
+
+        case "$choice" in
+            1)
+                printf 'Session name (blank = auto): '
+                read -r name
+                if [ -n "$name" ]; then
+                    tmux new-session -d -s "$name" 2>/dev/null \
+                        && tmux switch-client -t "$name" \
+                        || { printf 'Session "%s" already exists\n' "$name"; sleep 1; }
+                else
+                    tmux new-session -d
+                    tmux switch-client -t "$(tmux list-sessions -F '#S' | tail -1)"
+                fi
+                ;;
+            2)
+                target=$(_pick_session "Switch to") || continue
+                [ -n "$target" ] && tmux switch-client -t "$target"
+                ;;
+            3)
+                printf 'New name for current session: '
+                read -r name
+                [ -n "$name" ] && tmux rename-session "$name"
+                ;;
+            4)
+                target=$(_pick_session "Kill session") || continue
+                [ -n "$target" ] && tmux kill-session -t "$target"
+                ;;
+            5)
+                printf 'Window name (blank = auto): '
+                read -r name
+                if [ -n "$name" ]; then
+                    tmux new-window -n "$name" -c "#{pane_current_path}"
+                else
+                    tmux new-window -c "#{pane_current_path}"
+                fi
+                return
+                ;;
+            6)
+                n=$(_pick_window "Switch to window") || continue
+                [ -n "$n" ] && tmux select-window -t ":$n"
+                return
+                ;;
+            7)
+                printf 'New name for current window: '
+                read -r name
+                [ -n "$name" ] && tmux rename-window "$name"
+                ;;
+            8)
+                n=$(_pick_window "Kill window") || continue
+                [ -n "$n" ] && tmux kill-window -t ":$n"
+                ;;
+            9)
+                tmux split-window -h -c "#{pane_current_path}"
+                return
+                ;;
+            0)
+                tmux split-window -v -c "#{pane_current_path}"
+                return
+                ;;
+            p)
+                tmux kill-pane
+                return
+                ;;
+            q|Q)
+                return
+                ;;
+        esac
+    done
+}
+
+_menu_outside_tmux() {
+    while true; do
+        clear
+        _hr
+        printf '  tm\n'
+        _hr
+        _print_sessions
+        echo ""
+        printf '  1) new session\n'
+        printf '  2) attach session\n'
+        printf '  3) kill session\n'
+        printf '  q) quit\n'
+        echo ""
+        printf '> '
+        read -r choice
+
+        case "$choice" in
+            1)
+                printf 'Name (blank = main): '
+                read -r name
+                exec tmux new-session -s "${name:-main}"
+                ;;
+            2)
+                sessions=$(_sessions)
+                if [ -z "$sessions" ]; then
+                    printf 'No sessions.\n'
+                    sleep 1
+                    continue
+                fi
+                count=$(printf '%s\n' "$sessions" | wc -l)
+                if [ "$count" -eq 1 ]; then
+                    exec tmux attach -t "$(printf '%s\n' "$sessions" | head -1)"
+                fi
+                target=$(_pick_session "Attach to") || continue
+                [ -n "$target" ] && exec tmux attach -t "$target"
+                ;;
+            3)
+                target=$(_pick_session "Kill session") || continue
+                [ -n "$target" ] && tmux kill-session -t "$target" \
+                    && printf 'Killed: %s\n' "$target"
+                sleep 1
+                ;;
+            q|Q)
+                return
+                ;;
+        esac
+    done
+}
+
+if _in_tmux; then
+    _menu_inside_tmux
+else
+    _menu_outside_tmux
+fi
