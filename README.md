@@ -189,12 +189,25 @@ Ships as a single `bubble.pyz` zipapp via stdlib `zipapp`. ~217KB. No third-part
 ## Installation
 
 ```bash
-# Single artifact, drop and go
+# Recommended: install/update with replacement detection + backup
+./install.sh
+
+# Optional: choose a different destination path
+BUBBLE_INSTALL_PATH="$HOME/.local/bin/bubble" ./install.sh
+
+# Or pass a specific artifact path
+./install.sh /path/to/bubble.pyz
+
+# Manual install (single artifact, drop and go)
 cp bubble.pyz /usr/local/bin/bubble && chmod +x /usr/local/bin/bubble
 
-# Or run as a Python module
+# Run as a Python module
 python3 bubble.pyz vault list
 ```
+
+`install.sh` checks whether an existing `bubble` binary is already present at
+the destination. If the new artifact differs, it replaces it and writes a
+timestamped backup next to the old binary.
 
 ---
 
