@@ -204,8 +204,11 @@ def _swap_to_symlink(source: Path, target: Path) -> None:
     os.rename(str(source), str(swap))
     try:
         os.symlink(str(target), str(source))
-    except OSError:
+    except OSError as exc:
         os.rename(str(swap), str(source))
+        from . import host
+        kind = "permission_denied" if isinstance(exc, PermissionError) else "path_missing"
+        host.record_failure(kind, str(source), f"symlink -> {target}: {exc}")
         raise
     if swap.is_dir() and not swap.is_symlink():
         shutil.rmtree(swap)
@@ -218,9 +221,12 @@ def _swap_to_symlink(source: Path, target: Path) -> None:
 
 def wire(name: str) -> dict:
     """Recreate the source-path symlinks recorded in meta. For nuke recovery."""
+    from . import host
+
     meta = _read_meta(name)
     dest = _keep_dir(name)
     if not dest.exists():
+        host.record_failure("path_missing", str(dest), f"keep={name}: vault tree missing")
         raise FileNotFoundError(f"keep tree missing: {dest}")
     wired = []
     for entry in meta.get("symlinks", []):
@@ -229,14 +235,25 @@ def wire(name: str) -> dict:
         if src.is_symlink():
             if Path(os.readlink(src)) == target:
                 continue
+            host.record_failure(
+                "path_conflict", str(src),
+                f"keep={name}: already a symlink to {os.readlink(src)}",
+            )
             raise FileExistsError(
                 f"refuse: {src} is a symlink to {os.readlink(src)} — "
                 f"remove or rename first"
             )
         if src.exists():
+            host.record_failure("path_conflict", str(src),
+                                f"keep={name}: non-symlink occupies target")
             raise FileExistsError(f"refuse: {src} exists — remove or rename first")
         src.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(str(target), str(src))
+        try:
+            os.symlink(str(target), str(src))
+        except PermissionError as exc:
+            host.record_failure("permission_denied", str(src),
+                                f"symlink -> {target}: {exc}")
+            raise
         wired.append({"from": str(src), "to": str(target)})
     return {"name": name, "wired": wired}
 

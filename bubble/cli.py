@@ -563,11 +563,19 @@ def cmd_host(args: argparse.Namespace) -> int:
     failures = portrait.get("failures", [])
     if failures:
         print()
-        print(f"  observed failures ({len(failures)}):")
-        for f in failures[-10:]:  # last 10
-            print(f"    × [{f.get('kind','?')}] {f.get('target','?')}")
-            if f.get("detail"):
-                print(f"      {f['detail'][:140]}")
+        print(f"  observed failures ({len(failures)} recorded, "
+              f"{len(host.ledger())} distinct):")
+        for entry in host.ledger()[:10]:
+            count = f"×{entry['count']}" if entry["count"] > 1 else ""
+            print(f"    · [{entry['kind']}] {entry['target']}  {count}")
+            if entry.get("last_detail"):
+                print(f"      {entry['last_detail'][:140]}")
+        print()
+        print("  by category:")
+        for entry in host.ledger_by_kind():
+            print(f"    {entry['kind']:<28} {entry['count']:>4}  "
+                  f"({entry['distinct_targets']} distinct target"
+                  f"{'s' if entry['distinct_targets'] != 1 else ''})")
     else:
         print()
         print("  no runtime failures recorded yet")

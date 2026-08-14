@@ -70,6 +70,14 @@ FAILURE_KINDS: set[str] = {
     "substrate_downgraded",
     "sub_interp_reject",
     "dlmopen_unavailable",
+
+    # ─ filesystem boundaries (keep symlink swap/wire, shell linking)
+    "permission_denied",           # OS denied a write/symlink/rename
+    "path_missing",                # an expected path (source or target) is absent
+    "path_conflict",               # something already occupies the target path
+
+    # ─ hardware / build variant (runner native-load classification)
+    "hardware_variant_mismatch",   # native ext built for hardware absent here (e.g. CUDA)
 }
 
 
@@ -128,6 +136,77 @@ def is_known_failure(kind: str, target: str) -> Optional[dict]:
         if f.get("kind") == kind and f.get("target") == target:
             return f
     return None
+
+
+# ─────────────────────── the ledger (dedupe + tally) ────────────────────
+#
+# `known_failures()` is the raw append-only log — every occurrence, in
+# order, is the source of truth and nothing here changes it. The ledger is
+# a read-side view over that log: group repeat offenders together and count
+# them, so a package that fails the same way 40 times shows up as one row
+# with count=40 instead of 40 identical lines. Pure aggregation — nothing
+# consults this yet, it exists so the data is there to look at.
+
+
+def ledger() -> list[dict]:
+    """One row per (kind, target): count, first_seen, last_seen, last_detail.
+
+    Sorted by count descending, then most-recently-seen first — the
+    repeat offenders float to the top.
+    """
+    grouped: dict[tuple[str, str], dict] = {}
+    for f in known_failures():
+        key = (f.get("kind", "?"), f.get("target", "?"))
+        seen_at = f.get("recorded_at", "")
+        entry = grouped.get(key)
+        if entry is None:
+            grouped[key] = {
+                "kind": key[0],
+                "target": key[1],
+                "count": 1,
+                "first_seen": seen_at,
+                "last_seen": seen_at,
+                "last_detail": f.get("detail", ""),
+            }
+            continue
+        entry["count"] += 1
+        if seen_at and seen_at < entry["first_seen"]:
+            entry["first_seen"] = seen_at
+        if seen_at and seen_at >= entry["last_seen"]:
+            entry["last_seen"] = seen_at
+            entry["last_detail"] = f.get("detail", "")
+    return sorted(grouped.values(), key=lambda e: (e["count"], e["last_seen"]), reverse=True)
+
+
+def ledger_by_kind() -> list[dict]:
+    """One row per kind, collapsing targets: count, distinct_targets,
+    first_seen, last_seen. The category-level tally — which *class* of
+    fault dominates, independent of which package triggered each one."""
+    grouped: dict[str, dict] = {}
+    for f in known_failures():
+        kind = f.get("kind", "?")
+        seen_at = f.get("recorded_at", "")
+        entry = grouped.get(kind)
+        if entry is None:
+            grouped[kind] = {
+                "kind": kind,
+                "count": 1,
+                "distinct_targets": {f.get("target", "?")},
+                "first_seen": seen_at,
+                "last_seen": seen_at,
+            }
+            continue
+        entry["count"] += 1
+        entry["distinct_targets"].add(f.get("target", "?"))
+        if seen_at and seen_at < entry["first_seen"]:
+            entry["first_seen"] = seen_at
+        if seen_at and seen_at >= entry["last_seen"]:
+            entry["last_seen"] = seen_at
+    out = []
+    for entry in grouped.values():
+        entry["distinct_targets"] = len(entry["distinct_targets"])
+        out.append(entry)
+    return sorted(out, key=lambda e: (e["count"], e["last_seen"]), reverse=True)
 
 
 # ─────────────────────── writing observations back ─────────────────────

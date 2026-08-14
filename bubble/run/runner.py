@@ -24,6 +24,19 @@ from ..scanner import resolver as resolver_mod, py as scanner_py
 
 _MODNF_RE = re.compile(r"No module named '([^']+)'")
 
+# Native-load failures don't look like a missing module — there's nothing to
+# fetch, so the retry loop can't fix them. But the signatures are recognizable
+# enough to classify and record instead of just dumping stderr and giving up.
+# This is a fault surface the loop previously discarded silently.
+_CUDA_RE = re.compile(
+    r"CUDA driver version is insufficient|libcuda\.so|libcudart\.so|"
+    r"no CUDA-capable device|CUDA error|CUDA_ERROR_"
+)
+_ABI_RE = re.compile(
+    r"undefined symbol|wrong ELF class|"
+    r"version `GLIBC_[\d.]+' not found"
+)
+
 
 def run(env: BubbleEnv, cmd: list[str], *,
         max_retries: int = 8, verbose: bool = False) -> int:
@@ -50,7 +63,14 @@ def run(env: BubbleEnv, cmd: list[str], *,
             return 0
         m = _MODNF_RE.search(proc.stderr or "")
         if not m:
-            sys.stderr.write(proc.stderr)
+            stderr = proc.stderr or ""
+            target = cmd[1] if len(cmd) > 1 else (cmd[0] if cmd else "?")
+            from .. import host
+            if _CUDA_RE.search(stderr):
+                host.record_failure("hardware_variant_mismatch", target, stderr[-500:])
+            elif _ABI_RE.search(stderr):
+                host.record_failure("abi_mismatch", target, stderr[-500:])
+            sys.stderr.write(stderr)
             return proc.returncode
 
         missing_import = m.group(1).split(".")[0]

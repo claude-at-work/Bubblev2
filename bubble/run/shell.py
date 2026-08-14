@@ -313,7 +313,13 @@ def _rel_symlink(dest: Path, target: Path) -> None:
         else:
             dest.unlink()
     rel_target = os.path.relpath(target, start=dest.parent)
-    os.symlink(rel_target, dest)
+    try:
+        os.symlink(rel_target, dest)
+    except PermissionError as exc:
+        from .. import host
+        host.record_failure("permission_denied", str(dest),
+                            f"symlink -> {rel_target}: {exc}")
+        raise
 
 
 def _link_package(shell_lib: Path, vault_path: Path, pkg_name: str,
